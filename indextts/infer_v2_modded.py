@@ -1,5 +1,6 @@
 import os
 from subprocess import CalledProcessError
+from typing import Optional
 
 os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
 import json
@@ -19,7 +20,6 @@ from omegaconf import OmegaConf
 
 from indextts.gpt.model_v2 import UnifiedVoice
 from indextts.utils.maskgct_utils import build_semantic_model, build_semantic_codec
-from indextts.utils.checkpoint import load_checkpoint
 from indextts.utils.front import TextNormalizer, TextTokenizer
 
 from indextts.s2mel.modules.commons import load_checkpoint2, MyModel
@@ -36,9 +36,78 @@ import random
 import torch.nn.functional as F
 
 class IndexTTS2:
+    @staticmethod
+    def _load_gpt_state_dict(path: str) -> dict:
+        checkpoint = torch.load(path, map_location="cpu")
+        return checkpoint.get("model", checkpoint)
+
+    @staticmethod
+    def _infer_vocab_size(state_dict: dict) -> int | None:
+        for key in ("text_embedding.weight", "text_head.weight", "text_head.bias"):
+            tensor = state_dict.get(key)
+            if tensor is not None:
+                return tensor.shape[0]
+        return None
+
+    @staticmethod
+    def _resolve_attr(module, key: str):
+        obj = module
+        for part in key.split("."):
+            obj = getattr(obj, part)
+        return obj
+
+    @staticmethod
+    def _copy_resized_weight(name: str, param, weight: torch.Tensor) -> None:
+        target = param.data
+        source = weight.to(device=target.device, dtype=target.dtype)
+        if target.shape != source.shape:
+            print(f">> Reshaping GPT parameter '{name}' from {source.shape} to {target.shape}")
+        if target.ndim == 1:
+            length = min(target.shape[0], source.shape[0])
+            target[:length].copy_(source[:length])
+        elif target.ndim == 2:
+            rows = min(target.shape[0], source.shape[0])
+            cols = min(target.shape[1], source.shape[1])
+            target[:rows, :cols].copy_(source[:rows, :cols])
+        else:
+            raise ValueError(f"Unsupported tensor rank for '{name}': {target.ndim}")
+
+    def _load_gpt_weights(self, model: UnifiedVoice, state_dict: dict) -> None:
+        filtered_state: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key.startswith("inference_model."):
+                continue
+            if ".lora_" in key:
+                continue
+            new_key = key.replace(".base_layer.", ".")
+            filtered_state[new_key] = value
+
+        resizable_keys = ("text_embedding.weight", "text_head.weight", "text_head.bias")
+        resizable: dict[str, torch.Tensor] = {}
+        for key in resizable_keys:
+            tensor = filtered_state.pop(key, None)
+            if tensor is not None:
+                resizable[key] = tensor
+
+        missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+        if missing:
+            print(f">> GPT load missing keys: {missing}")
+        if unexpected:
+            print(f">> GPT load unexpected keys: {unexpected}")
+
+        for key, weight in resizable.items():
+            param = self._resolve_attr(model, key)
+            self._copy_resized_weight(key, param, weight)
+
     def __init__(
-            self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", is_fp16=False, device=None,
+            self,
+            cfg_path="checkpoints/config.yaml",
+            model_dir="checkpoints",
+            is_fp16=False,
+            device=None,
             use_cuda_kernel=None,
+            gpt_checkpoint_path: Optional[str] = None,
+            bpe_model_path: Optional[str] = None,
     ):
         """
         Args:
@@ -73,9 +142,25 @@ class IndexTTS2:
 
         self.qwen_emo = QwenEmotion(os.path.join(self.model_dir, self.cfg.qwen_emo_path))
 
+        if gpt_checkpoint_path is not None:
+            self.gpt_path = os.path.abspath(gpt_checkpoint_path)
+        else:
+            self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
+        if not os.path.isfile(self.gpt_path):
+            raise FileNotFoundError(f"GPT checkpoint not found: {self.gpt_path}")
+        gpt_state = self._load_gpt_state_dict(self.gpt_path)
+        vocab_from_checkpoint = self._infer_vocab_size(gpt_state)
+        if vocab_from_checkpoint:
+            current_vocab = self.cfg.gpt.get("number_text_tokens", vocab_from_checkpoint)
+            if current_vocab != vocab_from_checkpoint:
+                print(
+                    f">> Adjusting GPT config vocab size from "
+                    f"{current_vocab} to {vocab_from_checkpoint} based on checkpoint."
+                )
+                self.cfg.gpt.number_text_tokens = vocab_from_checkpoint
+
         self.gpt = UnifiedVoice(**self.cfg.gpt)
-        self.gpt_path = os.path.join(self.model_dir, self.cfg.gpt_checkpoint)
-        load_checkpoint(self.gpt, self.gpt_path)
+        self._load_gpt_weights(self.gpt, gpt_state)
         self.gpt = self.gpt.to(self.device)
         if self.is_fp16:
             self.gpt.eval().half()
@@ -153,7 +238,12 @@ class IndexTTS2:
         self.bigvgan.eval()
         print(">> bigvgan weights restored from:", bigvgan_name)
 
-        self.bpe_path = os.path.join(self.model_dir, self.cfg.dataset["bpe_model"])
+        if bpe_model_path is not None:
+            self.bpe_path = os.path.abspath(bpe_model_path)
+        else:
+            self.bpe_path = os.path.join(self.model_dir, self.cfg.dataset["bpe_model"])
+        if not os.path.isfile(self.bpe_path):
+            raise FileNotFoundError(f"BPE tokenizer not found: {self.bpe_path}")
         self.normalizer = TextNormalizer()
         self.normalizer.load()
         print(">> TextNormalizer loaded")
@@ -453,7 +543,7 @@ class IndexTTS2:
                         cond_lengths=torch.tensor([spk_cond_emb.shape[-1]], device=text_tokens.device),
                         emo_cond_lengths=torch.tensor([emo_cond_emb.shape[-1]], device=text_tokens.device),
                         emo_vec=emovec,
-                        do_sample=do_sample,
+                        do_sample=True,
                         top_p=top_p,
                         top_k=top_k,
                         temperature=temperature,
@@ -519,7 +609,7 @@ class IndexTTS2:
                 with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
                     m_start_time = time.perf_counter()
                     diffusion_steps = 25
-                    inference_cfg_rate = 0.2
+                    inference_cfg_rate = 0.7
                     latent = self.s2mel.models['gpt_layer'](latent)
                     S_infer = self.semantic_codec.quantizer.vq2emb(codes.unsqueeze(1))
                     S_infer = S_infer.transpose(1, 2)
