@@ -6,6 +6,12 @@ import sys
 import threading
 import time
 from pathlib import Path
+import re
+import csv
+import math
+import random
+from datetime import datetime
+from typing import Any, Optional
 
 import warnings
 
@@ -113,20 +119,182 @@ with open("examples/cases.jsonl", "r", encoding="utf-8") as f:
                              example.get("emo_vec_8",0)]
                              )
 
+CSV_HISTORY_PATH = os.path.join("outputs", "generation_history.csv")
+CSV_COLUMNS = [
+    "timestamp", "output_audio", "config_file", "prompt_audio", "prompt_audio_copy",
+    "text", "emotion_control_mode", "emotion_control_mode_name",
+    "emotion_reference_audio", "emotion_weight",
+    "vec_joy", "vec_anger", "vec_sadness", "vec_fear",
+    "vec_disgust", "vec_low_mood", "vec_surprise", "vec_calm",
+    "emotion_text", "emotion_random_sampling",
+    "do_sample", "temperature", "top_p", "top_k", "num_beams",
+    "repetition_penalty", "length_penalty",
+    "max_mel_tokens", "max_text_tokens_per_sentence", "seed",
+]
+
+
+def sanitize_for_filename(text):
+    """Extract first 3 words from text, sanitize for safe filenames."""
+    words = text.strip().split()[:3]
+    sanitized = []
+    for word in words:
+        clean = re.sub(r'[^\w]', '', word, flags=re.UNICODE)
+        if clean:
+            sanitized.append(clean.lower())
+    return '_'.join(sanitized) if sanitized else 'output'
+
+
+def make_output_basename(text):
+    """Generate output basename from datetime + first 3 words of text."""
+    now = datetime.now()
+    date_part = now.strftime("%Y-%m-%d_%H-%M-%S")
+    if not text or not text.strip():
+        return f"{date_part}_untitled"
+    word_part = sanitize_for_filename(text)
+    return f"{date_part}_{word_part}"
+
+
+def build_config_dict(output_path, config_path, prompt_audio, prompt_audio_copy,
+                      text, emo_control_method, emo_ref_path, emo_weight,
+                      vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
+                      emo_text, emo_random, max_text_tokens_per_sentence,
+                      do_sample, temperature, top_p, top_k,
+                      num_beams, repetition_penalty, length_penalty, max_mel_tokens,
+                      seed=None):
+    """Build a config dictionary with all generation parameters."""
+    mode = emo_control_method if isinstance(emo_control_method, int) else 0
+    return {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "output_audio": output_path,
+        "config_file": config_path,
+        "prompt_audio": prompt_audio,
+        "prompt_audio_copy": prompt_audio_copy,
+        "text": text,
+        "emotion_control_mode": mode,
+        "emotion_control_mode_name": EMO_CHOICES[mode] if 0 <= mode < len(EMO_CHOICES) else EMO_CHOICES[0],
+        "emotion_reference_audio": emo_ref_path,
+        "emotion_weight": float(emo_weight),
+        "emotion_vector": [float(v) for v in [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]],
+        "vec_joy": float(vec1),
+        "vec_anger": float(vec2),
+        "vec_sadness": float(vec3),
+        "vec_fear": float(vec4),
+        "vec_disgust": float(vec5),
+        "vec_low_mood": float(vec6),
+        "vec_surprise": float(vec7),
+        "vec_calm": float(vec8),
+        "emotion_text": emo_text or "",
+        "emotion_random_sampling": bool(emo_random),
+        "do_sample": bool(do_sample),
+        "temperature": float(temperature),
+        "top_p": float(top_p),
+        "top_k": int(top_k),
+        "num_beams": int(num_beams),
+        "repetition_penalty": float(repetition_penalty),
+        "length_penalty": float(length_penalty),
+        "max_mel_tokens": int(max_mel_tokens),
+        "max_text_tokens_per_sentence": int(max_text_tokens_per_sentence),
+        "seed": seed,
+    }
+
+
+def save_generation_config(wav_path, config_dict):
+    """Save config JSON alongside the WAV file."""
+    config_path = os.path.splitext(wav_path)[0] + '.json'
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(config_dict, f, indent=2, ensure_ascii=False)
+    return config_path
+
+
+def append_to_history_csv(config_dict):
+    """Append a generation record to the CSV history file."""
+    file_exists = os.path.exists(CSV_HISTORY_PATH)
+    with open(CSV_HISTORY_PATH, 'a', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction='ignore')
+        if not file_exists:
+            writer.writeheader()
+        row = dict(config_dict)
+        row.pop("emotion_vector", None)
+        writer.writerow(row)
+
+
+def copy_prompt_audio(prompt_path, basename):
+    """Copy prompt audio to outputs directory for reproducibility."""
+    if not prompt_path or not os.path.exists(prompt_path):
+        return None
+    ext = os.path.splitext(prompt_path)[1] or '.wav'
+    dest = os.path.join("outputs", f"{basename}_prompt{ext}")
+    try:
+        shutil.copy2(prompt_path, dest)
+        return dest
+    except Exception:
+        return None
+
+
+def normalize_seed(seed_value: Any) -> Optional[int]:
+    """Normalize a seed value from the UI into an int or None."""
+    if seed_value is None:
+        return None
+    if isinstance(seed_value, str):
+        value = seed_value.strip()
+        if not value:
+            return None
+        try:
+            seed = int(value)
+        except ValueError:
+            try:
+                seed = int(float(value))
+            except ValueError:
+                return None
+    elif isinstance(seed_value, bool):
+        seed = int(seed_value)
+    elif isinstance(seed_value, float):
+        if math.isnan(seed_value):
+            return None
+        seed = int(seed_value)
+    else:
+        try:
+            seed = int(seed_value)
+        except (TypeError, ValueError):
+            return None
+    if seed < 0:
+        seed = abs(seed)
+    return seed
+
+
+def apply_seed(seed: Optional[int]) -> None:
+    """Seed Python, NumPy, and PyTorch RNGs for reproducible generation."""
+    if seed is None:
+        return
+    import numpy as np
+    import torch
+    py_seed = int(seed % (2**32))
+    random.seed(py_seed)
+    np.random.seed(py_seed)
+    torch_seed = int(seed % (2**63 - 1))
+    torch.manual_seed(torch_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(torch_seed)
+    # Force deterministic CUDA operations for reproducibility
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
 
 def gen_single(emo_control_method,prompt, text,
                emo_ref_path, emo_weight,
                vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                emo_text,emo_random,
                max_text_tokens_per_sentence=120,
+               seed_value=None,
                 *args, progress=gr.Progress()):
-    output_path = None
-    if not output_path:
-        output_path = os.path.join("outputs", f"spk_{int(time.time())}.wav")
     # set gradio progress
     tts.gr_progress = progress
     do_sample, top_p, top_k, temperature, \
         length_penalty, num_beams, repetition_penalty, max_mel_tokens = args
+
+    # Apply seed for reproducible generation
+    seed_int = normalize_seed(seed_value)
+    apply_seed(seed_int)
     kwargs = {
         "do_sample": bool(do_sample),
         "top_p": float(top_p),
@@ -136,35 +304,81 @@ def gen_single(emo_control_method,prompt, text,
         "num_beams": num_beams,
         "repetition_penalty": float(repetition_penalty),
         "max_mel_tokens": int(max_mel_tokens),
-        # "typical_sampling": bool(typical_sampling),
-        # "typical_mass": float(typical_mass),
     }
+
+    # Save original UI values for config before mode-specific modifications
     if type(emo_control_method) is not int:
-        emo_control_method = emo_control_method.value
-    if emo_control_method == 0:
+        emo_mode = emo_control_method.value
+    else:
+        emo_mode = emo_control_method
+    orig_emo_ref_path = emo_ref_path
+    orig_emo_weight = emo_weight
+
+    if emo_mode == 0:
         emo_ref_path = None
         emo_weight = 1.0
-    if emo_control_method == 1:
-        emo_weight = emo_weight
-    if emo_control_method == 2:
+    if emo_mode == 2:
         vec = [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]
-        vec_sum = sum([vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8])
+        vec_sum = sum(vec)
         if vec_sum > 1.5:
             gr.Warning("Emotion vector sum cannot exceed 1.5. Adjust the sliders and retry.")
-            return
+            return gr.update(), gr.update()
     else:
         vec = None
 
-    print(f"Emo control mode:{emo_control_method},vec:{vec}")
+    # Generate descriptive filename: datetime + first 3 words
+    basename = make_output_basename(text or "untitled")
+    output_path = os.path.join("outputs", f"{basename}.wav")
+    counter = 1
+    base_no_ext = os.path.join("outputs", basename)
+    while os.path.exists(output_path):
+        output_path = f"{base_no_ext}_{counter}.wav"
+        counter += 1
+
+    # Copy prompt audio alongside output for reproducibility
+    output_basename = os.path.splitext(os.path.basename(output_path))[0]
+    prompt_copy = copy_prompt_audio(prompt, output_basename)
+
+    print(f"Emo control mode:{emo_mode},vec:{vec}")
     output = tts.infer(spk_audio_prompt=prompt, text=text,
                        output_path=output_path,
                        emo_audio_prompt=emo_ref_path, emo_alpha=emo_weight,
                        emo_vector=vec,
-                       use_emo_text=(emo_control_method==3), emo_text=emo_text,use_random=emo_random,
+                       use_emo_text=(emo_mode==3), emo_text=emo_text,use_random=emo_random,
                        verbose=cmd_args.verbose,
                        max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
                        **kwargs)
-    return gr.update(value=output,visible=True)
+
+    # Save config JSON alongside the WAV
+    config_path = os.path.splitext(output_path)[0] + '.json'
+    config = build_config_dict(
+        output_path=output_path,
+        config_path=config_path,
+        prompt_audio=prompt,
+        prompt_audio_copy=prompt_copy,
+        text=text,
+        emo_control_method=emo_mode,
+        emo_ref_path=orig_emo_ref_path,
+        emo_weight=orig_emo_weight,
+        vec1=vec1, vec2=vec2, vec3=vec3, vec4=vec4,
+        vec5=vec5, vec6=vec6, vec7=vec7, vec8=vec8,
+        emo_text=emo_text,
+        emo_random=emo_random,
+        max_text_tokens_per_sentence=max_text_tokens_per_sentence,
+        do_sample=do_sample,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        num_beams=num_beams,
+        repetition_penalty=repetition_penalty,
+        length_penalty=length_penalty,
+        max_mel_tokens=max_mel_tokens,
+        seed=seed_int,
+    )
+    save_generation_config(output_path, config)
+    append_to_history_csv(config)
+
+    return gr.update(value=output,visible=True), gr.update(value=config_path)
 
 def update_prompt_audio():
     update_button = gr.update(interactive=True)
@@ -231,6 +445,8 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                     repetition_penalty = gr.Number(label="repetition_penalty", precision=None, value=10.0, minimum=0.1, maximum=20.0, step=0.1)
                     length_penalty = gr.Number(label="length_penalty", precision=None, value=0.0, minimum=-2.0, maximum=2.0, step=0.1)
                 max_mel_tokens = gr.Slider(label="max_mel_tokens", value=1500, minimum=50, maximum=tts.cfg.gpt.max_mel_tokens, step=10, info="Maximum generated mel tokens")
+                seed_input = gr.Number(label="Seed", value=None, precision=0, minimum=0, step=1,
+                                       info="Leave blank for random; set a value for reproducible outputs")
             with gr.Column(scale=2):
                 gr.Markdown("**Sentence Settings** _Controls sentence splitting._")
                 with gr.Row():
@@ -256,6 +472,10 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
     with gr.Tabs():
         with gr.Tab("Single Generation"):
+            with gr.Accordion("Load Previous Config", open=False):
+                config_upload = gr.File(
+                    label="Drop a generation config JSON here to restore all settings",
+                    file_types=[".json"], type="filepath")
             with gr.Row():
                 prompt_audio = gr.Audio(label="Prompt Audio", key="prompt_audio",
                                         sources=["upload", "microphone"], type="filepath")
@@ -263,6 +483,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                     input_text_single = gr.TextArea(label="Text", key="input_text_single", placeholder="Enter text to synthesize", info=f"Model version {tts.model_version or '1.0'}")
                     gen_button = gr.Button("Generate", key="gen_button", interactive=True)
             output_audio = gr.Audio(label="Generated Result", visible=True, key="output_audio")
+            config_output = gr.File(label="Generation Config (JSON)", interactive=False)
 
             if len(example_cases) > 0:
                 gr.Examples(
@@ -836,6 +1057,82 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         status_update = format_batch_status(row, status_message if status_message else None)
         return updated_rows, table_update, dropdown_update, prompt_update, output_update, text_update, status_update
 
+    def load_config_from_file(config_file):
+        """Load a config JSON and fill in all UI components."""
+        num_outputs = 28
+        if not config_file:
+            return [gr.update()] * num_outputs
+        try:
+            with open(config_file, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        except Exception as e:
+            gr.Warning(f"Failed to load config: {e}")
+            return [gr.update()] * num_outputs
+
+        mode = config.get("emotion_control_mode", 0)
+        if not (0 <= mode < len(EMO_CHOICES)):
+            mode = 0
+        emo_mode_label = EMO_CHOICES[mode]
+
+        vec = config.get("emotion_vector", [0]*8)
+        while len(vec) < 8:
+            vec.append(0)
+
+        # Resolve prompt audio path: prefer the copy, fallback to original
+        prompt_path = config.get("prompt_audio_copy") or config.get("prompt_audio")
+        if prompt_path and not os.path.exists(prompt_path):
+            prompt_path = config.get("prompt_audio")
+            if prompt_path and not os.path.exists(prompt_path):
+                prompt_path = None
+
+        # Resolve emotion reference audio
+        emo_ref = config.get("emotion_reference_audio")
+        if emo_ref and not os.path.exists(emo_ref):
+            emo_ref = None
+
+        # Visibility settings matching on_method_select logic
+        if mode == 1:
+            ref_vis, random_vis, vec_vis, text_vis = True, False, False, False
+        elif mode == 2:
+            ref_vis, random_vis, vec_vis, text_vis = False, True, True, False
+        elif mode == 3:
+            ref_vis, random_vis, vec_vis, text_vis = False, True, False, True
+        else:
+            ref_vis, random_vis, vec_vis, text_vis = False, False, False, False
+
+        gr.Info("Config loaded successfully! All settings restored.")
+        return [
+            gr.update(value=prompt_path),                                          # prompt_audio
+            gr.update(value=config.get("text", "")),                               # input_text_single
+            gr.update(value=emo_mode_label),                                       # emo_control_method
+            gr.update(value=emo_ref),                                              # emo_upload
+            gr.update(value=config.get("emotion_weight", 0.8)),                    # emo_weight
+            gr.update(value=config.get("emotion_text", "")),                       # emo_text
+            gr.update(value=config.get("emotion_random_sampling", False),
+                      visible=random_vis),                                         # emo_random
+            gr.update(value=vec[0]),                                               # vec1
+            gr.update(value=vec[1]),                                               # vec2
+            gr.update(value=vec[2]),                                               # vec3
+            gr.update(value=vec[3]),                                               # vec4
+            gr.update(value=vec[4]),                                               # vec5
+            gr.update(value=vec[5]),                                               # vec6
+            gr.update(value=vec[6]),                                               # vec7
+            gr.update(value=vec[7]),                                               # vec8
+            gr.update(value=config.get("do_sample", True)),                        # do_sample
+            gr.update(value=config.get("temperature", 0.8)),                       # temperature
+            gr.update(value=config.get("top_p", 0.8)),                             # top_p
+            gr.update(value=config.get("top_k", 30)),                              # top_k
+            gr.update(value=config.get("num_beams", 3)),                           # num_beams
+            gr.update(value=config.get("repetition_penalty", 10.0)),               # repetition_penalty
+            gr.update(value=config.get("length_penalty", 0.0)),                    # length_penalty
+            gr.update(value=config.get("max_mel_tokens", 1500)),                   # max_mel_tokens
+            gr.update(value=config.get("max_text_tokens_per_sentence", 120)),      # max_text_tokens_per_sentence
+            gr.update(value=config.get("seed")),                                   # seed_input
+            gr.update(visible=ref_vis),                                            # emotion_reference_group
+            gr.update(visible=vec_vis),                                            # emotion_vector_group
+            gr.update(visible=text_vis),                                           # emo_text_group
+        ]
+
     emo_control_method.select(on_method_select,
         inputs=[emo_control_method],
         outputs=[emotion_reference_group,
@@ -863,9 +1160,24 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                             vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                              emo_text,emo_random,
                              max_text_tokens_per_sentence,
+                             seed_input,
                              *advanced_params,
                      ],
-                     outputs=[output_audio])
+                     outputs=[output_audio, config_output])
+
+    config_upload.change(
+        load_config_from_file,
+        inputs=[config_upload],
+        outputs=[
+            prompt_audio, input_text_single, emo_control_method,
+            emo_upload, emo_weight, emo_text, emo_random,
+            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
+            do_sample, temperature, top_p, top_k, num_beams,
+            repetition_penalty, length_penalty, max_mel_tokens,
+            max_text_tokens_per_sentence, seed_input,
+            emotion_reference_group, emotion_vector_group, emo_text_group,
+        ]
+    )
 
     batch_file_input.upload(
         add_batch_prompts,
