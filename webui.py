@@ -123,7 +123,7 @@ CSV_HISTORY_PATH = os.path.join("outputs", "generation_history.csv")
 CSV_COLUMNS = [
     "timestamp", "output_audio", "config_file", "prompt_audio", "prompt_audio_copy",
     "text", "emotion_control_mode", "emotion_control_mode_name",
-    "emotion_reference_audio", "emotion_weight",
+    "emotion_reference_audio", "emotion_reference_audio_copy", "emotion_weight",
     "vec_joy", "vec_anger", "vec_sadness", "vec_fear",
     "vec_disgust", "vec_low_mood", "vec_surprise", "vec_calm",
     "emotion_text", "emotion_random_sampling",
@@ -160,7 +160,7 @@ def build_config_dict(output_path, config_path, prompt_audio, prompt_audio_copy,
                       emo_text, emo_random, max_text_tokens_per_sentence,
                       do_sample, temperature, top_p, top_k,
                       num_beams, repetition_penalty, length_penalty, max_mel_tokens,
-                      seed=None):
+                      seed=None, emo_ref_copy=None):
     """Build a config dictionary with all generation parameters."""
     mode = emo_control_method if isinstance(emo_control_method, int) else 0
     return {
@@ -173,6 +173,7 @@ def build_config_dict(output_path, config_path, prompt_audio, prompt_audio_copy,
         "emotion_control_mode": mode,
         "emotion_control_mode_name": EMO_CHOICES[mode] if 0 <= mode < len(EMO_CHOICES) else EMO_CHOICES[0],
         "emotion_reference_audio": emo_ref_path,
+        "emotion_reference_audio_copy": emo_ref_copy,
         "emotion_weight": float(emo_weight),
         "emotion_vector": [float(v) for v in [vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8]],
         "vec_joy": float(vec1),
@@ -228,6 +229,44 @@ def copy_prompt_audio(prompt_path, basename):
         shutil.copy2(prompt_path, dest)
         return dest
     except Exception:
+        return None
+
+
+import hashlib
+
+EMOTION_REF_DIR = os.path.join("prompts", "emotion_ref")
+os.makedirs(EMOTION_REF_DIR, exist_ok=True)
+
+
+def _file_content_hash(filepath):
+    """Return a short SHA-256 hex digest of a file's contents."""
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def persist_emotion_ref_audio(src_path):
+    """Copy emotion reference audio to prompts/emotion_ref/ if not already there.
+
+    Uses a content hash so the same file is never stored twice.
+    Returns the persisted path, or None if src_path is empty/missing.
+    """
+    if not src_path or not os.path.exists(src_path):
+        return None
+    content_hash = _file_content_hash(src_path)
+    ext = os.path.splitext(src_path)[1] or ".wav"
+    orig_stem = re.sub(r'[^\w]', '_', os.path.splitext(os.path.basename(src_path))[0])
+    dest_name = f"{orig_stem}_{content_hash}{ext}"
+    dest_path = os.path.join(EMOTION_REF_DIR, dest_name)
+    if os.path.exists(dest_path):
+        return dest_path
+    try:
+        shutil.copy2(src_path, dest_path)
+        return dest_path
+    except Exception:
+        logger.exception("Failed to persist emotion ref audio %s", src_path)
         return None
 
 
@@ -314,6 +353,9 @@ def gen_single(emo_control_method,prompt, text,
     orig_emo_ref_path = emo_ref_path
     orig_emo_weight = emo_weight
 
+    # Persist emotion reference audio so it survives temp-dir cleanup
+    persisted_emo_ref = persist_emotion_ref_audio(emo_ref_path)
+
     if emo_mode == 0:
         emo_ref_path = None
         emo_weight = 1.0
@@ -359,6 +401,7 @@ def gen_single(emo_control_method,prompt, text,
         text=text,
         emo_control_method=emo_mode,
         emo_ref_path=orig_emo_ref_path,
+        emo_ref_copy=persisted_emo_ref,
         emo_weight=orig_emo_weight,
         vec1=vec1, vec2=vec2, vec3=vec3, vec4=vec4,
         vec5=vec5, vec6=vec6, vec7=vec7, vec8=vec8,
@@ -1085,10 +1128,12 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             if prompt_path and not os.path.exists(prompt_path):
                 prompt_path = None
 
-        # Resolve emotion reference audio
-        emo_ref = config.get("emotion_reference_audio")
+        # Resolve emotion reference audio: prefer persisted copy, fallback to original
+        emo_ref = config.get("emotion_reference_audio_copy") or config.get("emotion_reference_audio")
         if emo_ref and not os.path.exists(emo_ref):
-            emo_ref = None
+            emo_ref = config.get("emotion_reference_audio")
+            if emo_ref and not os.path.exists(emo_ref):
+                emo_ref = None
 
         # Visibility settings matching on_method_select logic
         if mode == 1:
