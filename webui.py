@@ -89,6 +89,7 @@ EMO_CHOICES = [
     "Use emotion text description",
 ]
 os.makedirs("outputs/tasks",exist_ok=True)
+os.makedirs("outputs/dialogue",exist_ok=True)
 os.makedirs("prompts",exist_ok=True)
 
 MAX_LENGTH_TO_USE_SPEED = 70
@@ -317,6 +318,76 @@ def apply_seed(seed: Optional[int]) -> None:
     # Force deterministic CUDA operations for reproducibility
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
+
+def load_config_for_generation(config_data):
+    """Extract all tts.infer() parameters from a config dict.
+
+    Resolves prompt audio and emotion ref audio paths (preferring persisted
+    copies, falling back to originals).  Returns a dict ready to drive
+    tts.infer(), or None if the prompt audio cannot be found.
+    """
+    # Resolve prompt audio
+    prompt_audio = config_data.get("prompt_audio_copy") or config_data.get("prompt_audio")
+    if prompt_audio and not os.path.exists(prompt_audio):
+        prompt_audio = config_data.get("prompt_audio")
+        if prompt_audio and not os.path.exists(prompt_audio):
+            prompt_audio = None
+    if not prompt_audio:
+        return None
+
+    # Emotion mode
+    emo_mode = config_data.get("emotion_control_mode", 0)
+    if not isinstance(emo_mode, int):
+        try:
+            emo_mode = int(emo_mode)
+        except (TypeError, ValueError):
+            emo_mode = 0
+
+    # Resolve emotion reference audio
+    emo_ref = config_data.get("emotion_reference_audio_copy") or config_data.get("emotion_reference_audio")
+    if emo_ref and not os.path.exists(emo_ref):
+        emo_ref = config_data.get("emotion_reference_audio")
+        if emo_ref and not os.path.exists(emo_ref):
+            emo_ref = None
+
+    emo_weight = float(config_data.get("emotion_weight", 0.8))
+
+    vec = config_data.get("emotion_vector", [0] * 8)
+    while len(vec) < 8:
+        vec.append(0)
+    vec = [float(v) for v in vec]
+
+    emo_text = config_data.get("emotion_text", "")
+    emo_random = bool(config_data.get("emotion_random_sampling", False))
+
+    max_text_tokens = int(config_data.get("max_text_tokens_per_sentence", 120))
+    seed = normalize_seed(config_data.get("seed"))
+
+    generation_kwargs = {
+        "do_sample": bool(config_data.get("do_sample", True)),
+        "top_p": float(config_data.get("top_p", 0.8)),
+        "top_k": int(config_data.get("top_k", 30)) if int(config_data.get("top_k", 30)) > 0 else None,
+        "temperature": float(config_data.get("temperature", 0.8)),
+        "length_penalty": float(config_data.get("length_penalty", 0.0)),
+        "num_beams": int(config_data.get("num_beams", 3)),
+        "repetition_penalty": float(config_data.get("repetition_penalty", 10.0)),
+        "max_mel_tokens": int(config_data.get("max_mel_tokens", 1500)),
+    }
+
+    return {
+        "prompt_audio": prompt_audio,
+        "emo_mode": emo_mode,
+        "emo_ref": emo_ref if emo_mode == 1 else None,
+        "emo_weight": emo_weight if emo_mode == 1 else 1.0,
+        "emo_vector": vec if emo_mode == 2 else None,
+        "emo_text": emo_text,
+        "emo_random": emo_random,
+        "use_emo_text": (emo_mode == 3),
+        "max_text_tokens": max_text_tokens,
+        "seed": seed,
+        "generation_kwargs": generation_kwargs,
+    }
 
 
 def gen_single(emo_control_method,prompt, text,
@@ -579,6 +650,65 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                     with gr.Row():
                         delete_entry_button = gr.Button("Delete Selected")
                         clear_entries_button = gr.Button("Clear All")
+
+        with gr.Tab("Dialogue Generation"):
+            gr.Markdown("Upload a CSV of dialogue lines. Each line references a JSON config from Single Generation. Generate all lines with per-line voice/emotion settings.")
+            dialogue_rows_state = gr.State([])
+            next_dialogue_id_state = gr.State(1)
+            with gr.Row():
+                with gr.Column(scale=2):
+                    with gr.Row():
+                        dialogue_csv_path_input = gr.Textbox(
+                            label="Dialogue CSV path",
+                            placeholder="e.g. scripts/my_dialogue.csv",
+                            scale=4
+                        )
+                        load_dialogue_csv_button = gr.Button("Load", scale=0)
+                        save_dialogue_csv_button = gr.Button("Save", scale=0)
+                        clear_dialogue_button = gr.Button("Clear", scale=0)
+                    dialogue_table = gr.Dataframe(
+                        headers=["Line#", "Character", "Text", "Config", "Status", "Last Gen"],
+                        datatype=["number", "str", "str", "str", "str", "str"],
+                        row_count=(0, "dynamic"),
+                        col_count=6,
+                        interactive=False,
+                        value=[]
+                    )
+                with gr.Column(scale=1):
+                    dialogue_selected_entry = gr.Dropdown(
+                        label="Select line",
+                        choices=[],
+                        value=None,
+                        interactive=True
+                    )
+                    with gr.Group():
+                        gr.Markdown("**Assign Config**")
+                        with gr.Row():
+                            json_file_dropdown = gr.Dropdown(
+                                label="JSON config file",
+                                choices=[],
+                                value=None,
+                                allow_custom_value=True,
+                                interactive=True,
+                                scale=4
+                            )
+                            refresh_json_list_button = gr.Button("Refresh", scale=0)
+                        assign_config_button = gr.Button("Assign Config to Selected Line")
+                    dialogue_config_preview = gr.Code(
+                        label="Config Preview",
+                        language="json",
+                        interactive=False,
+                        lines=12
+                    )
+                    dialogue_output_player = gr.Audio(
+                        label="Generated Audio",
+                        type="filepath",
+                        interactive=False
+                    )
+                    dialogue_status = gr.Markdown(value="No line selected.")
+                    with gr.Row():
+                        generate_dialogue_button = gr.Button("Generate All")
+                        regenerate_dialogue_line_button = gr.Button("Regenerate Selected")
 
     def on_input_text_change(text, max_tokens_per_sentence):
         if text and len(text) > 0:
@@ -1178,6 +1308,578 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             gr.update(visible=text_vis),                                           # emo_text_group
         ]
 
+    # --- Dialogue Generation helpers ---
+
+    def build_dialogue_table_data(rows):
+        table_data = []
+        for row in rows or []:
+            text_preview = row.get("text", "") or ""
+            if len(text_preview) > 50:
+                text_preview = text_preview[:47] + "..."
+            config_path = row.get("config_json_path", "") or ""
+            config_display = os.path.basename(config_path) if config_path else ""
+            table_data.append([
+                row.get("id"),
+                row.get("character", ""),
+                text_preview,
+                config_display,
+                row.get("status", "Pending"),
+                row.get("last_generated", ""),
+            ])
+        return table_data
+
+    def find_dialogue_row(rows, row_id):
+        if row_id is None:
+            return None
+        for row in rows or []:
+            if row.get("id") == row_id:
+                return row
+        return None
+
+    def resolve_dialogue_selection(rows, selected_value):
+        choices = [f"{row.get('id')}: {row.get('character', '')}" for row in rows or []]
+        id_map = {f"{row.get('id')}: {row.get('character', '')}": row.get("id") for row in rows or []}
+        if not choices:
+            return gr.update(choices=[], value=None), None
+        if selected_value is not None:
+            if selected_value in id_map:
+                return gr.update(choices=choices, value=selected_value), id_map[selected_value]
+            # Try matching by ID prefix
+            for choice in choices:
+                if choice.startswith(f"{selected_value}:") or str(selected_value) == choice.split(":")[0].strip():
+                    return gr.update(choices=choices, value=choice), id_map[choice]
+        # Default to first
+        return gr.update(choices=choices, value=choices[0]), id_map[choices[0]]
+
+    def prepare_dialogue_selection(rows, selected_value):
+        dropdown_update, resolved_id = resolve_dialogue_selection(rows, selected_value)
+        row = find_dialogue_row(rows, resolved_id)
+        config_preview = ""
+        if row and row.get("config_data"):
+            config_preview = json.dumps(row["config_data"], indent=2, ensure_ascii=False)
+        output_update = gr.update(value=row.get("output_path") if row and row.get("output_path") else None)
+        return dropdown_update, resolved_id, config_preview, output_update, row
+
+    def format_dialogue_status(row, message=None):
+        if not row:
+            base = "No line selected."
+        else:
+            lines = [f"**Line {row.get('id')}** — {row.get('character', 'Unknown')}: {row.get('status', 'Pending')}"]
+            if row.get("config_json_path"):
+                lines.append(f"Config: `{os.path.basename(row['config_json_path'])}`")
+            else:
+                lines.append("Config: **None assigned**")
+            if row.get("output_path"):
+                lines.append(f"Output: `{os.path.basename(row['output_path'])}`")
+            if row.get("last_generated"):
+                lines.append(f"Last generated: {row['last_generated']}")
+            base = "  \n".join(lines)
+        if message:
+            base = f"{base}  \n{message}" if base else message
+        return gr.update(value=base)
+
+    def refresh_json_dropdown():
+        outputs_dir = os.path.abspath(os.path.join(current_dir, "outputs"))
+        json_files = []
+        if os.path.isdir(outputs_dir):
+            for f in os.listdir(outputs_dir):
+                if f.endswith(".json") and f != "generation_history.csv":
+                    full = os.path.join(outputs_dir, f)
+                    json_files.append((os.path.getmtime(full), f))
+        json_files.sort(key=lambda x: x[0], reverse=True)
+        choices = [name for _, name in json_files]
+        return gr.update(choices=choices, value=choices[0] if choices else None)
+
+    def load_dialogue_csv(csv_path, rows, next_id):
+        rows = rows or []
+        next_id = next_id or 1
+        csv_path = (csv_path or "").strip()
+        if not csv_path:
+            gr.Warning("Enter a CSV path first.")
+            dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, None)
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(sel_row)
+            return rows, next_id, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        csv_path = os.path.abspath(csv_path) if not os.path.isabs(csv_path) else csv_path
+        if not os.path.exists(csv_path):
+            gr.Warning(f"File not found: {csv_path}")
+            dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, None)
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(sel_row, "File not found.")
+            return rows, next_id, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        try:
+            df = pd.read_csv(csv_path, dtype=str, keep_default_na=False)
+        except Exception as e:
+            gr.Warning(f"Failed to read CSV: {e}")
+            dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, None)
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(sel_row, f"CSV error: {e}")
+            return rows, next_id, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        required_cols = {"character", "text"}
+        csv_cols_lower = {c.strip().lower(): c for c in df.columns}
+        if not required_cols.issubset(csv_cols_lower.keys()):
+            gr.Warning(f"CSV must have 'character' and 'text' columns. Found: {list(df.columns)}")
+            dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, None)
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(sel_row, "CSV missing required columns.")
+            return rows, next_id, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        # Normalize column access
+        char_col = csv_cols_lower["character"]
+        text_col = csv_cols_lower["text"]
+        config_col = csv_cols_lower.get("config_json", None)
+        output_col = csv_cols_lower.get("output_wav", None)
+        status_col = csv_cols_lower.get("status", None)
+        last_gen_col = csv_cols_lower.get("last_generated", None)
+
+        updated_rows = []  # fresh start from CSV
+        first_id = next_id
+        for _, csv_row in df.iterrows():
+            character = str(csv_row[char_col]).strip()
+            text_val = str(csv_row[text_col]).strip()
+            config_path = ""
+            if config_col and config_col in csv_row.index:
+                config_path = str(csv_row[config_col]).strip()
+
+            # Restore previous results if present
+            saved_output = ""
+            if output_col and output_col in csv_row.index:
+                saved_output = str(csv_row[output_col]).strip()
+            saved_status = ""
+            if status_col and status_col in csv_row.index:
+                saved_status = str(csv_row[status_col]).strip()
+            saved_last_gen = ""
+            if last_gen_col and last_gen_col in csv_row.index:
+                saved_last_gen = str(csv_row[last_gen_col]).strip()
+
+            config_data = None
+            status = "No Config"
+            if config_path:
+                if os.path.exists(config_path):
+                    try:
+                        with open(config_path, 'r', encoding='utf-8') as f:
+                            config_data = json.load(f)
+                        status = "Pending"
+                    except Exception:
+                        status = "Config Error"
+                else:
+                    status = "Config Not Found"
+
+            # If CSV had a saved status, restore it (trust completed state)
+            output_path = None
+            last_generated = ""
+            if saved_status == "Completed" and saved_output and os.path.exists(saved_output):
+                status = "Completed"
+                output_path = saved_output
+                last_generated = saved_last_gen
+            elif saved_status and saved_status != "Completed":
+                # Keep the freshly determined status (re-validates config)
+                pass
+
+            entry = {
+                "id": next_id,
+                "character": character,
+                "text": text_val,
+                "config_json_path": config_path if config_path else None,
+                "config_data": config_data,
+                "output_path": output_path,
+                "status": status,
+                "last_generated": last_generated,
+            }
+            updated_rows.append(entry)
+            next_id += 1
+
+        added = len(updated_rows)
+        completed = sum(1 for r in updated_rows if r["status"] == "Completed")
+        pending = sum(1 for r in updated_rows if r["status"] == "Pending")
+        no_config = sum(1 for r in updated_rows if r["status"] == "No Config")
+
+        dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(updated_rows, first_id)
+        table_update = gr.update(value=build_dialogue_table_data(updated_rows))
+        parts = [f"Loaded {added} lines."]
+        if completed:
+            parts.append(f"{completed} completed")
+        if pending:
+            parts.append(f"{pending} ready")
+        if no_config:
+            parts.append(f"{no_config} need config")
+        msg = " ".join(parts)
+        status_update = format_dialogue_status(sel_row, msg)
+        return updated_rows, next_id, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+    def assign_config_to_dialogue_line(rows, selected_value, json_filename):
+        rows = rows or []
+        if not json_filename:
+            gr.Warning("Select a JSON config file first.")
+            dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, selected_value)
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(sel_row, "No config file selected.")
+            return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        # Resolve JSON path
+        json_path = json_filename
+        if not os.path.isabs(json_path):
+            json_path = os.path.join("outputs", json_filename)
+        if not os.path.exists(json_path):
+            gr.Warning(f"Config file not found: {json_path}")
+            dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, selected_value)
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(sel_row, f"File not found: {json_path}")
+            return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        dropdown_update, resolved_id, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, selected_value)
+        if not sel_row:
+            gr.Warning("Select a line first.")
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(None, "No line selected.")
+            return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                config_data = json.load(f)
+        except Exception as e:
+            gr.Warning(f"Failed to load JSON: {e}")
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(sel_row, f"JSON error: {e}")
+            return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        updated_rows = []
+        for row in rows:
+            new_row = dict(row)
+            if new_row.get("id") == resolved_id:
+                new_row["config_json_path"] = json_path
+                new_row["config_data"] = config_data
+                new_row["status"] = "Pending"
+            updated_rows.append(new_row)
+
+        dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(updated_rows, selected_value)
+        table_update = gr.update(value=build_dialogue_table_data(updated_rows))
+        status_update = format_dialogue_status(sel_row, f"Config assigned: {os.path.basename(json_path)}")
+        return updated_rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+    def on_select_dialogue_entry(selected_value, rows):
+        dropdown_update, resolved_id, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, selected_value)
+        status_update = format_dialogue_status(sel_row)
+        return dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+    def clear_dialogue_rows():
+        return (
+            [],
+            1,
+            gr.update(value=[]),
+            gr.update(choices=[], value=None),
+            gr.update(value=""),
+            gr.update(value=None),
+            format_dialogue_status(None, "Dialogue list cleared."),
+            gr.update(value=""),  # clear csv path textbox
+        )
+
+    def save_dialogue_csv(rows, csv_path, silent=False):
+        """Overwrite the source CSV with current dialogue state including results."""
+        rows = rows or []
+        if not rows:
+            if not silent:
+                gr.Warning("No dialogue lines to save.")
+            return
+        csv_path = (csv_path or "").strip()
+        if not csv_path:
+            if not silent:
+                gr.Warning("No CSV path. Enter a path first.")
+            return
+        csv_path = os.path.abspath(csv_path) if not os.path.isabs(csv_path) else csv_path
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(["character", "text", "config_json", "output_wav", "status", "last_generated"])
+            for row in rows:
+                writer.writerow([
+                    row.get("character", ""),
+                    row.get("text", ""),
+                    row.get("config_json_path") or "",
+                    row.get("output_path") or "",
+                    row.get("status", ""),
+                    row.get("last_generated", ""),
+                ])
+        if not silent:
+            gr.Info(f"CSV saved: {csv_path}")
+
+    def save_dialogue_results_csv(rows, session_dir):
+        """Write an updated CSV with output_wav column into the session directory."""
+        csv_path = os.path.join(session_dir, "dialogue_results.csv")
+        with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(["character", "text", "config_json", "output_wav", "status"])
+            for row in rows or []:
+                writer.writerow([
+                    row.get("character", ""),
+                    row.get("text", ""),
+                    row.get("config_json_path", ""),
+                    row.get("output_path", ""),
+                    row.get("status", ""),
+                ])
+        return csv_path
+
+    def generate_all_dialogue(rows, selected_value, csv_path, progress=gr.Progress()):
+        rows = rows or []
+        if not rows:
+            gr.Warning("Upload a dialogue CSV first.")
+            dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, selected_value)
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(sel_row)
+            return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        # Create session directory
+        session_name = f"session_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        session_dir = os.path.join("outputs", "dialogue", session_name)
+        os.makedirs(session_dir, exist_ok=True)
+
+        updated_rows = []
+        total = len(rows)
+        success_count = 0
+        progress(0.0, desc="Starting dialogue generation")
+
+        for idx, row in enumerate(rows):
+            new_row = dict(row)
+
+            # Load config_data from JSON if not cached
+            if not new_row.get("config_data") and new_row.get("config_json_path"):
+                try:
+                    with open(new_row["config_json_path"], 'r', encoding='utf-8') as f:
+                        new_row["config_data"] = json.load(f)
+                except Exception:
+                    new_row["status"] = "Error: Config unreadable"
+                    updated_rows.append(new_row)
+                    continue
+
+            if not new_row.get("config_data"):
+                new_row["status"] = "Error: No config"
+                updated_rows.append(new_row)
+                continue
+
+            text_val = (new_row.get("text") or "").strip()
+            if not text_val:
+                new_row["status"] = "Error: No text"
+                updated_rows.append(new_row)
+                continue
+
+            params = load_config_for_generation(new_row["config_data"])
+            if params is None:
+                new_row["status"] = "Error: Prompt audio missing"
+                updated_rows.append(new_row)
+                continue
+
+            # Apply seed
+            apply_seed(params["seed"])
+
+            # Build output path: 001_AB_firstwords_timestamp.wav
+            char_name = new_row.get("character", "XX")
+            char_prefix = re.sub(r'[^\w]', '', char_name)[:2].upper().ljust(2, 'X')
+            words_safe = sanitize_for_filename(text_val)
+            output_filename = f"{idx + 1:03d}_{char_prefix}_{words_safe}_{int(time.time())}.wav"
+            output_path = os.path.join(session_dir, output_filename)
+
+            try:
+                tts.gr_progress = progress
+                tts.infer(
+                    spk_audio_prompt=params["prompt_audio"],
+                    text=text_val,
+                    output_path=output_path,
+                    emo_audio_prompt=params["emo_ref"],
+                    emo_alpha=params["emo_weight"],
+                    emo_vector=params["emo_vector"],
+                    use_emo_text=params["use_emo_text"],
+                    emo_text=params["emo_text"],
+                    use_random=params["emo_random"],
+                    verbose=cmd_args.verbose,
+                    max_text_tokens_per_sentence=params["max_text_tokens"],
+                    **params["generation_kwargs"],
+                )
+                new_row["output_path"] = output_path
+                new_row["status"] = "Completed"
+                new_row["last_generated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+                success_count += 1
+
+                # Save per-line config JSON alongside WAV
+                cfg = new_row["config_data"]
+                vec = cfg.get("emotion_vector", [0]*8)
+                while len(vec) < 8:
+                    vec.append(0)
+                line_config = build_config_dict(
+                    output_path=output_path,
+                    config_path=os.path.splitext(output_path)[0] + ".json",
+                    prompt_audio=cfg.get("prompt_audio", ""),
+                    prompt_audio_copy=cfg.get("prompt_audio_copy", ""),
+                    text=text_val,
+                    emo_control_method=cfg.get("emotion_control_mode", 0),
+                    emo_ref_path=cfg.get("emotion_reference_audio", ""),
+                    emo_ref_copy=cfg.get("emotion_reference_audio_copy", ""),
+                    emo_weight=cfg.get("emotion_weight", 0.8),
+                    vec1=vec[0], vec2=vec[1], vec3=vec[2], vec4=vec[3],
+                    vec5=vec[4], vec6=vec[5], vec7=vec[6], vec8=vec[7],
+                    emo_text=cfg.get("emotion_text", ""),
+                    emo_random=cfg.get("emotion_random_sampling", False),
+                    max_text_tokens_per_sentence=cfg.get("max_text_tokens_per_sentence", 120),
+                    do_sample=cfg.get("do_sample", True),
+                    temperature=cfg.get("temperature", 0.8),
+                    top_p=cfg.get("top_p", 0.8),
+                    top_k=cfg.get("top_k", 30),
+                    num_beams=cfg.get("num_beams", 3),
+                    repetition_penalty=cfg.get("repetition_penalty", 10.0),
+                    length_penalty=cfg.get("length_penalty", 0.0),
+                    max_mel_tokens=cfg.get("max_mel_tokens", 1500),
+                    seed=params["seed"],
+                )
+                save_generation_config(output_path, line_config)
+
+            except Exception as exc:
+                logger.exception("Dialogue generation failed for line %s", new_row.get("id"))
+                new_row["status"] = f"Error: {exc}"
+
+            updated_rows.append(new_row)
+            progress(min((idx + 1) / total, 1.0), desc=f"Generated {idx + 1}/{total}")
+
+        # Save updated results CSV to session dir and auto-save source CSV
+        save_dialogue_results_csv(updated_rows, session_dir)
+        save_dialogue_csv(updated_rows, csv_path, silent=True)
+
+        dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(updated_rows, selected_value)
+        table_update = gr.update(value=build_dialogue_table_data(updated_rows))
+        msg = f"Generated {success_count}/{total} lines. Output: `{session_name}/`"
+        status_update = format_dialogue_status(sel_row, msg)
+        return updated_rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+    def regenerate_dialogue_line(rows, selected_value, csv_path, progress=gr.Progress()):
+        rows = rows or []
+        dropdown_update, resolved_id, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, selected_value)
+        if not sel_row:
+            gr.Warning("Select a line to regenerate.")
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(None)
+            return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        # Load config_data from JSON if not cached
+        if not sel_row.get("config_data") and sel_row.get("config_json_path"):
+            try:
+                with open(sel_row["config_json_path"], 'r', encoding='utf-8') as f:
+                    sel_row["config_data"] = json.load(f)
+            except Exception as e:
+                gr.Warning(f"Failed to read config: {e}")
+                table_update = gr.update(value=build_dialogue_table_data(rows))
+                status_update = format_dialogue_status(sel_row, f"Config error: {e}")
+                return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        if not sel_row.get("config_data"):
+            gr.Warning("No config assigned to this line.")
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(sel_row, "Assign a config first.")
+            return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        text_val = (sel_row.get("text") or "").strip()
+        if not text_val:
+            gr.Warning("Line has no text.")
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(sel_row, "Text is empty.")
+            return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        params = load_config_for_generation(sel_row["config_data"])
+        if params is None:
+            gr.Warning("Prompt audio from config is missing.")
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(sel_row, "Prompt audio not found.")
+            return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        apply_seed(params["seed"])
+
+        # Use existing session dir if possible, otherwise create new
+        if sel_row.get("output_path"):
+            session_dir = os.path.dirname(sel_row["output_path"])
+        else:
+            session_name = f"session_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+            session_dir = os.path.join("outputs", "dialogue", session_name)
+        os.makedirs(session_dir, exist_ok=True)
+
+        char_name = sel_row.get("character", "XX")
+        char_prefix = re.sub(r'[^\w]', '', char_name)[:2].upper().ljust(2, 'X')
+        words_safe = sanitize_for_filename(text_val)
+        line_num = sel_row.get("id", 0)
+        output_filename = f"{line_num:03d}_{char_prefix}_{words_safe}_{int(time.time())}.wav"
+        output_path = os.path.join(session_dir, output_filename)
+
+        result_rows = []
+        for row in rows:
+            if row.get("id") != resolved_id:
+                result_rows.append(dict(row))
+                continue
+            updated_row = dict(row)
+            updated_row["config_data"] = sel_row.get("config_data")
+            try:
+                tts.gr_progress = progress
+                tts.infer(
+                    spk_audio_prompt=params["prompt_audio"],
+                    text=text_val,
+                    output_path=output_path,
+                    emo_audio_prompt=params["emo_ref"],
+                    emo_alpha=params["emo_weight"],
+                    emo_vector=params["emo_vector"],
+                    use_emo_text=params["use_emo_text"],
+                    emo_text=params["emo_text"],
+                    use_random=params["emo_random"],
+                    verbose=cmd_args.verbose,
+                    max_text_tokens_per_sentence=params["max_text_tokens"],
+                    **params["generation_kwargs"],
+                )
+                updated_row["output_path"] = output_path
+                updated_row["status"] = "Completed"
+                updated_row["last_generated"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+                # Save per-line config
+                cfg = updated_row["config_data"]
+                vec = cfg.get("emotion_vector", [0]*8)
+                while len(vec) < 8:
+                    vec.append(0)
+                line_config = build_config_dict(
+                    output_path=output_path,
+                    config_path=os.path.splitext(output_path)[0] + ".json",
+                    prompt_audio=cfg.get("prompt_audio", ""),
+                    prompt_audio_copy=cfg.get("prompt_audio_copy", ""),
+                    text=text_val,
+                    emo_control_method=cfg.get("emotion_control_mode", 0),
+                    emo_ref_path=cfg.get("emotion_reference_audio", ""),
+                    emo_ref_copy=cfg.get("emotion_reference_audio_copy", ""),
+                    emo_weight=cfg.get("emotion_weight", 0.8),
+                    vec1=vec[0], vec2=vec[1], vec3=vec[2], vec4=vec[3],
+                    vec5=vec[4], vec6=vec[5], vec7=vec[6], vec8=vec[7],
+                    emo_text=cfg.get("emotion_text", ""),
+                    emo_random=cfg.get("emotion_random_sampling", False),
+                    max_text_tokens_per_sentence=cfg.get("max_text_tokens_per_sentence", 120),
+                    do_sample=cfg.get("do_sample", True),
+                    temperature=cfg.get("temperature", 0.8),
+                    top_p=cfg.get("top_p", 0.8),
+                    top_k=cfg.get("top_k", 30),
+                    num_beams=cfg.get("num_beams", 3),
+                    repetition_penalty=cfg.get("repetition_penalty", 10.0),
+                    length_penalty=cfg.get("length_penalty", 0.0),
+                    max_mel_tokens=cfg.get("max_mel_tokens", 1500),
+                    seed=params["seed"],
+                )
+                save_generation_config(output_path, line_config)
+
+            except Exception as exc:
+                logger.exception("Dialogue regeneration failed for line %s", updated_row.get("id"))
+                updated_row["status"] = f"Error: {exc}"
+            result_rows.append(updated_row)
+
+        # Save updated results CSV
+        save_dialogue_results_csv(result_rows, session_dir)
+        save_dialogue_csv(result_rows, csv_path, silent=True)
+
+        dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(result_rows, selected_value)
+        table_update = gr.update(value=build_dialogue_table_data(result_rows))
+        status_update = format_dialogue_status(sel_row, "Regeneration finished.")
+        return result_rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
     emo_control_method.select(on_method_select,
         inputs=[emo_control_method],
         outputs=[emotion_reference_group,
@@ -1278,6 +1980,55 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         outputs=[batch_rows_state, next_batch_id_state, batch_table, selected_entry, batch_prompt_player, batch_output_player, batch_text_input, batch_status]
     )
 
+    # --- Dialogue Generation event handlers ---
+
+    load_dialogue_csv_button.click(
+        load_dialogue_csv,
+        inputs=[dialogue_csv_path_input, dialogue_rows_state, next_dialogue_id_state],
+        outputs=[dialogue_rows_state, next_dialogue_id_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status]
+    )
+
+    refresh_json_list_button.click(
+        refresh_json_dropdown,
+        inputs=[],
+        outputs=[json_file_dropdown]
+    )
+
+    assign_config_button.click(
+        assign_config_to_dialogue_line,
+        inputs=[dialogue_rows_state, dialogue_selected_entry, json_file_dropdown],
+        outputs=[dialogue_rows_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status]
+    )
+
+    save_dialogue_csv_button.click(
+        save_dialogue_csv,
+        inputs=[dialogue_rows_state, dialogue_csv_path_input],
+        outputs=[]
+    )
+
+    dialogue_selected_entry.change(
+        on_select_dialogue_entry,
+        inputs=[dialogue_selected_entry, dialogue_rows_state],
+        outputs=[dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status]
+    )
+
+    generate_dialogue_button.click(
+        generate_all_dialogue,
+        inputs=[dialogue_rows_state, dialogue_selected_entry, dialogue_csv_path_input],
+        outputs=[dialogue_rows_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status]
+    )
+
+    regenerate_dialogue_line_button.click(
+        regenerate_dialogue_line,
+        inputs=[dialogue_rows_state, dialogue_selected_entry, dialogue_csv_path_input],
+        outputs=[dialogue_rows_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status]
+    )
+
+    clear_dialogue_button.click(
+        clear_dialogue_rows,
+        inputs=[],
+        outputs=[dialogue_rows_state, next_dialogue_id_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status, dialogue_csv_path_input]
+    )
 
 
 if __name__ == "__main__":
