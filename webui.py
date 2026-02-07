@@ -90,6 +90,7 @@ EMO_CHOICES = [
 ]
 os.makedirs("outputs/tasks",exist_ok=True)
 os.makedirs("outputs/dialogue",exist_ok=True)
+os.makedirs("tasks/override_config",exist_ok=True)
 os.makedirs("prompts",exist_ok=True)
 
 MAX_LENGTH_TO_USE_SPEED = 70
@@ -658,11 +659,15 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             with gr.Row():
                 with gr.Column(scale=2):
                     with gr.Row():
-                        dialogue_csv_path_input = gr.Textbox(
-                            label="Dialogue CSV path",
-                            placeholder="e.g. scripts/my_dialogue.csv",
+                        dialogue_csv_dropdown = gr.Dropdown(
+                            label="Dialogue CSV",
+                            choices=[],
+                            value=None,
+                            allow_custom_value=True,
+                            interactive=True,
                             scale=4
                         )
+                        refresh_dialogue_csv_button = gr.Button("Refresh", scale=0)
                         load_dialogue_csv_button = gr.Button("Load", scale=0)
                         save_dialogue_csv_button = gr.Button("Save", scale=0)
                         clear_dialogue_button = gr.Button("Clear", scale=0)
@@ -694,6 +699,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                             )
                             refresh_json_list_button = gr.Button("Refresh", scale=0)
                         assign_config_button = gr.Button("Assign Config to Selected Line")
+                    save_override_button = gr.Button("Save Override (current settings \u2192 this line)")
                     dialogue_config_preview = gr.Code(
                         label="Config Preview",
                         language="json",
@@ -1232,81 +1238,16 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
     def load_config_from_file(config_file):
         """Load a config JSON and fill in all UI components."""
-        num_outputs = 28
         if not config_file:
-            return [gr.update()] * num_outputs
+            return [gr.update()] * 28
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
                 config = json.load(f)
         except Exception as e:
             gr.Warning(f"Failed to load config: {e}")
-            return [gr.update()] * num_outputs
-
-        mode = config.get("emotion_control_mode", 0)
-        if not (0 <= mode < len(EMO_CHOICES)):
-            mode = 0
-        emo_mode_label = EMO_CHOICES[mode]
-
-        vec = config.get("emotion_vector", [0]*8)
-        while len(vec) < 8:
-            vec.append(0)
-
-        # Resolve prompt audio path: prefer the copy, fallback to original
-        prompt_path = config.get("prompt_audio_copy") or config.get("prompt_audio")
-        if prompt_path and not os.path.exists(prompt_path):
-            prompt_path = config.get("prompt_audio")
-            if prompt_path and not os.path.exists(prompt_path):
-                prompt_path = None
-
-        # Resolve emotion reference audio: prefer persisted copy, fallback to original
-        emo_ref = config.get("emotion_reference_audio_copy") or config.get("emotion_reference_audio")
-        if emo_ref and not os.path.exists(emo_ref):
-            emo_ref = config.get("emotion_reference_audio")
-            if emo_ref and not os.path.exists(emo_ref):
-                emo_ref = None
-
-        # Visibility settings matching on_method_select logic
-        if mode == 1:
-            ref_vis, random_vis, vec_vis, text_vis = True, False, False, False
-        elif mode == 2:
-            ref_vis, random_vis, vec_vis, text_vis = False, True, True, False
-        elif mode == 3:
-            ref_vis, random_vis, vec_vis, text_vis = False, True, False, True
-        else:
-            ref_vis, random_vis, vec_vis, text_vis = False, False, False, False
-
+            return [gr.update()] * 28
         gr.Info("Config loaded successfully! All settings restored.")
-        return [
-            gr.update(value=prompt_path),                                          # prompt_audio
-            gr.update(value=config.get("text", "")),                               # input_text_single
-            gr.update(value=emo_mode_label),                                       # emo_control_method
-            gr.update(value=emo_ref),                                              # emo_upload
-            gr.update(value=config.get("emotion_weight", 0.8)),                    # emo_weight
-            gr.update(value=config.get("emotion_text", "")),                       # emo_text
-            gr.update(value=config.get("emotion_random_sampling", False),
-                      visible=random_vis),                                         # emo_random
-            gr.update(value=vec[0]),                                               # vec1
-            gr.update(value=vec[1]),                                               # vec2
-            gr.update(value=vec[2]),                                               # vec3
-            gr.update(value=vec[3]),                                               # vec4
-            gr.update(value=vec[4]),                                               # vec5
-            gr.update(value=vec[5]),                                               # vec6
-            gr.update(value=vec[6]),                                               # vec7
-            gr.update(value=vec[7]),                                               # vec8
-            gr.update(value=config.get("do_sample", True)),                        # do_sample
-            gr.update(value=config.get("temperature", 0.8)),                       # temperature
-            gr.update(value=config.get("top_p", 0.8)),                             # top_p
-            gr.update(value=config.get("top_k", 30)),                              # top_k
-            gr.update(value=config.get("num_beams", 3)),                           # num_beams
-            gr.update(value=config.get("repetition_penalty", 10.0)),               # repetition_penalty
-            gr.update(value=config.get("length_penalty", 0.0)),                    # length_penalty
-            gr.update(value=config.get("max_mel_tokens", 1500)),                   # max_mel_tokens
-            gr.update(value=config.get("max_text_tokens_per_sentence", 120)),      # max_text_tokens_per_sentence
-            gr.update(value=config.get("seed")),                                   # seed_input
-            gr.update(visible=ref_vis),                                            # emotion_reference_group
-            gr.update(visible=vec_vis),                                            # emotion_vector_group
-            gr.update(visible=text_vis),                                           # emo_text_group
-        ]
+        return _config_to_ui_updates(config)
 
     # --- Dialogue Generation helpers ---
 
@@ -1390,20 +1331,47 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         choices = [name for _, name in json_files]
         return gr.update(choices=choices, value=choices[0] if choices else None)
 
-    def load_dialogue_csv(csv_path, rows, next_id):
-        rows = rows or []
-        next_id = next_id or 1
+    def refresh_dialogue_csv_dropdown():
+        tasks_dir = os.path.abspath(os.path.join(current_dir, "tasks"))
+        csv_files = []
+        if os.path.isdir(tasks_dir):
+            for f in os.listdir(tasks_dir):
+                if f.endswith(".csv"):
+                    full = os.path.join(tasks_dir, f)
+                    csv_files.append((os.path.getmtime(full), f))
+        csv_files.sort(key=lambda x: x[0], reverse=True)
+        choices = [name for _, name in csv_files]
+        return gr.update(choices=choices, value=choices[0] if choices else None)
+
+    def _resolve_csv_path(csv_path):
+        """Resolve a CSV dropdown value to an absolute path (looks in tasks/ first)."""
         csv_path = (csv_path or "").strip()
         if not csv_path:
-            gr.Warning("Enter a CSV path first.")
+            return None
+        if os.path.isabs(csv_path) and os.path.exists(csv_path):
+            return csv_path
+        # Try tasks/ folder first
+        tasks_candidate = os.path.join("tasks", csv_path)
+        if os.path.exists(tasks_candidate):
+            return os.path.abspath(tasks_candidate)
+        # Try as-is (relative to cwd)
+        if os.path.exists(csv_path):
+            return os.path.abspath(csv_path)
+        return None
+
+    def load_dialogue_csv(csv_path_raw, rows, next_id):
+        rows = rows or []
+        next_id = next_id or 1
+        if not (csv_path_raw or "").strip():
+            gr.Warning("Select a CSV file first.")
             dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, None)
             table_update = gr.update(value=build_dialogue_table_data(rows))
             status_update = format_dialogue_status(sel_row)
             return rows, next_id, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
 
-        csv_path = os.path.abspath(csv_path) if not os.path.isabs(csv_path) else csv_path
-        if not os.path.exists(csv_path):
-            gr.Warning(f"File not found: {csv_path}")
+        csv_path = _resolve_csv_path(csv_path_raw)
+        if not csv_path:
+            gr.Warning(f"File not found: {csv_path_raw}")
             dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, None)
             table_update = gr.update(value=build_dialogue_table_data(rows))
             status_update = format_dialogue_status(sel_row, "File not found.")
@@ -1560,10 +1528,78 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         status_update = format_dialogue_status(sel_row, f"Config assigned: {os.path.basename(json_path)}")
         return updated_rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
 
+    def _config_to_ui_updates(config):
+        """Convert a config dict to the 28 UI component updates (same order as load_config_from_file)."""
+        if not config:
+            return [gr.update()] * 28
+
+        mode = config.get("emotion_control_mode", 0)
+        if not (0 <= mode < len(EMO_CHOICES)):
+            mode = 0
+        emo_mode_label = EMO_CHOICES[mode]
+
+        vec = config.get("emotion_vector", [0]*8)
+        while len(vec) < 8:
+            vec.append(0)
+
+        prompt_path = config.get("prompt_audio_copy") or config.get("prompt_audio")
+        if prompt_path and not os.path.exists(prompt_path):
+            prompt_path = config.get("prompt_audio")
+            if prompt_path and not os.path.exists(prompt_path):
+                prompt_path = None
+
+        emo_ref = config.get("emotion_reference_audio_copy") or config.get("emotion_reference_audio")
+        if emo_ref and not os.path.exists(emo_ref):
+            emo_ref = config.get("emotion_reference_audio")
+            if emo_ref and not os.path.exists(emo_ref):
+                emo_ref = None
+
+        if mode == 1:
+            ref_vis, random_vis, vec_vis, text_vis = True, False, False, False
+        elif mode == 2:
+            ref_vis, random_vis, vec_vis, text_vis = False, True, True, False
+        elif mode == 3:
+            ref_vis, random_vis, vec_vis, text_vis = False, True, False, True
+        else:
+            ref_vis, random_vis, vec_vis, text_vis = False, False, False, False
+
+        return [
+            gr.update(value=prompt_path),
+            gr.update(value=config.get("text", "")),
+            gr.update(value=emo_mode_label),
+            gr.update(value=emo_ref),
+            gr.update(value=config.get("emotion_weight", 0.8)),
+            gr.update(value=config.get("emotion_text", "")),
+            gr.update(value=config.get("emotion_random_sampling", False), visible=random_vis),
+            gr.update(value=vec[0]),
+            gr.update(value=vec[1]),
+            gr.update(value=vec[2]),
+            gr.update(value=vec[3]),
+            gr.update(value=vec[4]),
+            gr.update(value=vec[5]),
+            gr.update(value=vec[6]),
+            gr.update(value=vec[7]),
+            gr.update(value=config.get("do_sample", True)),
+            gr.update(value=config.get("temperature", 0.8)),
+            gr.update(value=config.get("top_p", 0.8)),
+            gr.update(value=config.get("top_k", 30)),
+            gr.update(value=config.get("num_beams", 3)),
+            gr.update(value=config.get("repetition_penalty", 10.0)),
+            gr.update(value=config.get("length_penalty", 0.0)),
+            gr.update(value=config.get("max_mel_tokens", 1500)),
+            gr.update(value=config.get("max_text_tokens_per_sentence", 120)),
+            gr.update(value=config.get("seed")),
+            gr.update(visible=ref_vis),
+            gr.update(visible=vec_vis),
+            gr.update(visible=text_vis),
+        ]
+
     def on_select_dialogue_entry(selected_value, rows):
         dropdown_update, resolved_id, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, selected_value)
         status_update = format_dialogue_status(sel_row)
-        return dropdown_update, gr.update(value=config_preview), output_update, status_update
+        config_data = sel_row.get("config_data") if sel_row else None
+        ui_updates = _config_to_ui_updates(config_data)
+        return [dropdown_update, gr.update(value=config_preview), output_update, status_update] + ui_updates
 
     def clear_dialogue_rows():
         return (
@@ -1574,22 +1610,115 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             gr.update(value=""),
             gr.update(value=None),
             format_dialogue_status(None, "Dialogue list cleared."),
-            gr.update(value=""),  # clear csv path textbox
+            gr.update(value=None),  # clear csv dropdown
         )
 
-    def save_dialogue_csv(rows, csv_path, silent=False):
+    def save_override_config(rows, selected_value, csv_path_raw,
+                                prompt_audio_val, input_text_val,
+                                emo_control_method_val, emo_upload_val, emo_weight_val,
+                                emo_text_val, emo_random_val,
+                                v1, v2, v3, v4, v5, v6, v7, v8,
+                                do_sample_val, temperature_val, top_p_val, top_k_val,
+                                num_beams_val, repetition_penalty_val, length_penalty_val,
+                                max_mel_tokens_val, max_text_tokens_val, seed_val):
+        """Save current UI settings as an override config for the selected dialogue line."""
+        rows = rows or []
+        dropdown_update, resolved_id, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, selected_value)
+        if not sel_row:
+            gr.Warning("Select a dialogue line first.")
+            table_update = gr.update(value=build_dialogue_table_data(rows))
+            status_update = format_dialogue_status(None)
+            return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        # Determine emotion mode
+        if isinstance(emo_control_method_val, int):
+            emo_mode = emo_control_method_val
+        elif isinstance(emo_control_method_val, str) and emo_control_method_val in EMO_CHOICES:
+            emo_mode = EMO_CHOICES.index(emo_control_method_val)
+        else:
+            emo_mode = 0
+
+        # Persist emotion ref if needed
+        persisted_emo_ref = persist_emotion_ref_audio(emo_upload_val)
+
+        # Build config dict from current UI state
+        seed_int = normalize_seed(seed_val)
+        config_data = build_config_dict(
+            output_path="",
+            config_path="",
+            prompt_audio=prompt_audio_val or "",
+            prompt_audio_copy="",
+            text=input_text_val or "",
+            emo_control_method=emo_mode,
+            emo_ref_path=emo_upload_val or "",
+            emo_ref_copy=persisted_emo_ref,
+            emo_weight=emo_weight_val,
+            vec1=v1, vec2=v2, vec3=v3, vec4=v4,
+            vec5=v5, vec6=v6, vec7=v7, vec8=v8,
+            emo_text=emo_text_val,
+            emo_random=emo_random_val,
+            max_text_tokens_per_sentence=max_text_tokens_val,
+            do_sample=do_sample_val,
+            temperature=temperature_val,
+            top_p=top_p_val,
+            top_k=top_k_val,
+            num_beams=num_beams_val,
+            repetition_penalty=repetition_penalty_val,
+            length_penalty=length_penalty_val,
+            max_mel_tokens=max_mel_tokens_val,
+            seed=seed_int,
+        )
+
+        # Deterministic override filename: {csv_stem}_line{id}.json
+        csv_name = (csv_path_raw or "").strip()
+        if csv_name:
+            csv_stem = os.path.splitext(os.path.basename(csv_name))[0]
+        else:
+            csv_stem = "dialogue"
+        override_filename = f"{csv_stem}_line{resolved_id:03d}.json"
+        override_path = os.path.join("tasks", "override_config", override_filename)
+        config_data["config_file"] = override_path
+
+        with open(override_path, 'w', encoding='utf-8') as f:
+            json.dump(config_data, f, indent=2, ensure_ascii=False)
+
+        # Update the row to point to the override config
+        updated_rows = []
+        for row in rows:
+            new_row = dict(row)
+            if new_row.get("id") == resolved_id:
+                new_row["config_json_path"] = override_path
+                new_row["config_data"] = config_data
+                new_row["status"] = "Pending" if new_row["status"] != "Completed" else "Completed"
+            updated_rows.append(new_row)
+
+        # Auto-save CSV
+        save_dialogue_csv(updated_rows, csv_path_raw, silent=True)
+
+        dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(updated_rows, selected_value)
+        table_update = gr.update(value=build_dialogue_table_data(updated_rows))
+        status_update = format_dialogue_status(sel_row, f"Override saved: `{override_filename}`")
+        gr.Info(f"Override config saved: {override_path}")
+        return updated_rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+    def save_dialogue_csv(rows, csv_path_raw, silent=False):
         """Overwrite the source CSV with current dialogue state including results."""
         rows = rows or []
         if not rows:
             if not silent:
                 gr.Warning("No dialogue lines to save.")
             return
-        csv_path = (csv_path or "").strip()
+        csv_path = _resolve_csv_path(csv_path_raw)
         if not csv_path:
-            if not silent:
-                gr.Warning("No CSV path. Enter a path first.")
-            return
-        csv_path = os.path.abspath(csv_path) if not os.path.isabs(csv_path) else csv_path
+            # If file doesn't exist yet but we have a raw path, resolve it for creation
+            raw = (csv_path_raw or "").strip()
+            if raw:
+                csv_path = os.path.join("tasks", raw) if not os.path.isabs(raw) else raw
+                csv_path = os.path.abspath(csv_path)
+            else:
+                if not silent:
+                    gr.Warning("No CSV selected.")
+                return
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
             writer.writerow(["character", "text", "config_json", "output_wav", "status", "last_generated"])
@@ -1982,9 +2111,15 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
     # --- Dialogue Generation event handlers ---
 
+    refresh_dialogue_csv_button.click(
+        refresh_dialogue_csv_dropdown,
+        inputs=[],
+        outputs=[dialogue_csv_dropdown]
+    )
+
     load_dialogue_csv_button.click(
         load_dialogue_csv,
-        inputs=[dialogue_csv_path_input, dialogue_rows_state, next_dialogue_id_state],
+        inputs=[dialogue_csv_dropdown, dialogue_rows_state, next_dialogue_id_state],
         outputs=[dialogue_rows_state, next_dialogue_id_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status]
     )
 
@@ -2002,32 +2137,57 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
     save_dialogue_csv_button.click(
         save_dialogue_csv,
-        inputs=[dialogue_rows_state, dialogue_csv_path_input],
+        inputs=[dialogue_rows_state, dialogue_csv_dropdown],
         outputs=[]
+    )
+
+    save_override_button.click(
+        save_override_config,
+        inputs=[
+            dialogue_rows_state, dialogue_selected_entry, dialogue_csv_dropdown,
+            prompt_audio, input_text_single,
+            emo_control_method, emo_upload, emo_weight,
+            emo_text, emo_random,
+            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
+            do_sample, temperature, top_p, top_k,
+            num_beams, repetition_penalty, length_penalty,
+            max_mel_tokens, max_text_tokens_per_sentence, seed_input,
+        ],
+        outputs=[dialogue_rows_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status]
     )
 
     dialogue_selected_entry.change(
         on_select_dialogue_entry,
         inputs=[dialogue_selected_entry, dialogue_rows_state],
-        outputs=[dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status]
+        outputs=[
+            dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status,
+            # 28 global UI components (same order as load_config_from_file)
+            prompt_audio, input_text_single, emo_control_method,
+            emo_upload, emo_weight, emo_text, emo_random,
+            vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
+            do_sample, temperature, top_p, top_k, num_beams,
+            repetition_penalty, length_penalty, max_mel_tokens,
+            max_text_tokens_per_sentence, seed_input,
+            emotion_reference_group, emotion_vector_group, emo_text_group,
+        ]
     )
 
     generate_dialogue_button.click(
         generate_all_dialogue,
-        inputs=[dialogue_rows_state, dialogue_selected_entry, dialogue_csv_path_input],
+        inputs=[dialogue_rows_state, dialogue_selected_entry, dialogue_csv_dropdown],
         outputs=[dialogue_rows_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status]
     )
 
     regenerate_dialogue_line_button.click(
         regenerate_dialogue_line,
-        inputs=[dialogue_rows_state, dialogue_selected_entry, dialogue_csv_path_input],
+        inputs=[dialogue_rows_state, dialogue_selected_entry, dialogue_csv_dropdown],
         outputs=[dialogue_rows_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status]
     )
 
     clear_dialogue_button.click(
         clear_dialogue_rows,
         inputs=[],
-        outputs=[dialogue_rows_state, next_dialogue_id_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status, dialogue_csv_path_input]
+        outputs=[dialogue_rows_state, next_dialogue_id_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status, dialogue_csv_dropdown]
     )
 
 
