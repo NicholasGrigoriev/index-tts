@@ -249,6 +249,32 @@ def _file_content_hash(filepath):
     return h.hexdigest()[:16]
 
 
+def persist_prompt_audio(src_path):
+    """Copy prompt audio to prompts/ if not already there.
+
+    Uses a content hash so the same file is never stored twice.
+    Returns the persisted path, or None if src_path is empty/missing.
+    """
+    if not src_path or not os.path.exists(src_path):
+        return None
+    # Already inside prompts/ — no need to copy
+    if os.path.abspath(src_path).startswith(os.path.abspath("prompts")):
+        return src_path
+    content_hash = _file_content_hash(src_path)
+    ext = os.path.splitext(src_path)[1] or ".wav"
+    orig_stem = re.sub(r'[^\w]', '_', os.path.splitext(os.path.basename(src_path))[0])
+    dest_name = f"{orig_stem}_{content_hash}{ext}"
+    dest_path = os.path.join("prompts", dest_name)
+    if os.path.exists(dest_path):
+        return dest_path
+    try:
+        shutil.copy2(src_path, dest_path)
+        return dest_path
+    except Exception:
+        logger.exception("Failed to persist prompt audio %s", src_path)
+        return None
+
+
 def persist_emotion_ref_audio(src_path):
     """Copy emotion reference audio to prompts/emotion_ref/ if not already there.
 
@@ -1638,19 +1664,20 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         else:
             emo_mode = 0
 
-        # Persist emotion ref if needed
+        # Persist audio files from temp to project folders
+        persisted_prompt = persist_prompt_audio(prompt_audio_val)
         persisted_emo_ref = persist_emotion_ref_audio(emo_upload_val)
 
-        # Build config dict from current UI state
+        # Build config dict from current UI state (use persisted paths)
         seed_int = normalize_seed(seed_val)
         config_data = build_config_dict(
             output_path="",
             config_path="",
-            prompt_audio=prompt_audio_val or "",
-            prompt_audio_copy="",
+            prompt_audio=persisted_prompt or prompt_audio_val or "",
+            prompt_audio_copy=persisted_prompt or "",
             text=input_text_val or "",
             emo_control_method=emo_mode,
-            emo_ref_path=emo_upload_val or "",
+            emo_ref_path=persisted_emo_ref or emo_upload_val or "",
             emo_ref_copy=persisted_emo_ref,
             emo_weight=emo_weight_val,
             vec1=v1, vec2=v2, vec3=v3, vec4=v4,
