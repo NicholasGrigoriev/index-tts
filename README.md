@@ -20,6 +20,48 @@ uv run huggingface-cli download Jmica/IndexTTS2 --local-dir checkpoints
 uv run .\webui_parallel.py
 ```
 
+## What's in this fork (NicholasGrigoriev/index-tts, `youtube` branch)
+
+This fork adds a few quality-of-life features on top of JarodMica's `youtube`
+branch. To use it, clone from `https://github.com/NicholasGrigoriev/index-tts.git`
+instead of the upstream URL above and keep the same `git switch youtube` step.
+
+### Dialogue Generation tab
+A workflow for long multi-line scripts:
+
+- **Per-line configs** — assign a saved JSON config to each line of a dialogue,
+  with a live preview of the selected line's settings.
+- **CSV persistence** — the script and each line's config path are persisted to
+  `tasks/<name>.csv`. Pick a CSV from the dropdown (Refresh button re-scans the
+  `tasks/` folder); selecting a line populates the global emotion/generation UI
+  with that line's config.
+- **Save Override** — write the current UI settings to
+  `tasks/override_config/<deterministic-name>.json` and point the selected line
+  at it. The original config file is never modified.
+- **Prompt / emotion ref audio persistence** — reference audio is copied from
+  Gradio's temp folder into `prompts/` with content-hash deduping, so saved
+  configs keep working after Gradio cleans up its temp dir.
+- **Auto-save** — changes to the dialogue table are persisted to the active
+  CSV without a separate save step.
+
+The Batch Generation tab has been removed; the audio player and generate
+buttons now live at the top of the Dialogue tab.
+
+### Inline pause tags
+Drop `[pause:500ms]` or `[pause:1.5s]` into any text input (single-shot or
+Dialogue) and silence of the requested duration is spliced in between the
+surrounding segments. No overhead when the text contains no pause tags.
+
+### Interval silence slider
+New `Interval silence (ms)` control (0–2000 ms, default 200 ms) that exposes
+the TTS `interval_silence` parameter — the gap between auto-split sentence
+segments. Persisted with save/load config and available on all three
+generation paths (single-shot, Dialogue generate, Dialogue re-generate).
+
+### Dialogue tab JSON config input
+The old config dropdown has been replaced with a drag-and-drop `gr.File`
+component — drop a JSON onto it to assign it to the selected line.
+
 ## 👉🏻 IndexTTS2 👈🏻
 
 <center><h3>IndexTTS2: A Breakthrough in Emotionally Expressive and Duration-Controlled Auto-Regressive Zero-Shot Text-to-Speech</h3></center>
