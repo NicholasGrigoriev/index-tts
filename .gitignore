@@ -36,3 +36,8 @@ prompts/
 *_dataset/
 
 *.whl
+
+# Dialogue Generation tab local scratch: per-project CSVs and overrides.
+tasks/
+# Accidental `> nul` redirect artefact from a Windows shell.
+nul

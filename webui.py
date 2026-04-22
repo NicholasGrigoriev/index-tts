@@ -162,7 +162,7 @@ def build_config_dict(output_path, config_path, prompt_audio, prompt_audio_copy,
                       emo_text, emo_random, max_text_tokens_per_sentence,
                       do_sample, temperature, top_p, top_k,
                       num_beams, repetition_penalty, length_penalty, max_mel_tokens,
-                      seed=None, emo_ref_copy=None):
+                      seed=None, emo_ref_copy=None, interval_silence=200):
     """Build a config dictionary with all generation parameters."""
     mode = emo_control_method if isinstance(emo_control_method, int) else 0
     return {
@@ -197,6 +197,7 @@ def build_config_dict(output_path, config_path, prompt_audio, prompt_audio_copy,
         "length_penalty": float(length_penalty),
         "max_mel_tokens": int(max_mel_tokens),
         "max_text_tokens_per_sentence": int(max_text_tokens_per_sentence),
+        "interval_silence": int(interval_silence),
         "seed": seed,
     }
 
@@ -347,6 +348,84 @@ def apply_seed(seed: Optional[int]) -> None:
     torch.backends.cudnn.benchmark = False
 
 
+PAUSE_TAG_PATTERN = re.compile(r'\[pause:(\d+(?:\.\d+)?)(ms|s)\]', re.IGNORECASE)
+
+
+def parse_pause_segments(text):
+    """Parse text with [pause:Xms]/[pause:Xs] tags.
+
+    Returns list of ("text", content) or ("pause", duration_ms) tuples.
+    Empty text segments are omitted.
+    """
+    segments = []
+    last_end = 0
+    for m in PAUSE_TAG_PATTERN.finditer(text):
+        before = text[last_end:m.start()].strip()
+        if before:
+            segments.append(("text", before))
+        value = float(m.group(1))
+        unit = m.group(2).lower()
+        duration_ms = value if unit == "ms" else value * 1000
+        if duration_ms > 0:
+            segments.append(("pause", duration_ms))
+        last_end = m.end()
+    after = text[last_end:].strip()
+    if after:
+        segments.append(("text", after))
+    return segments
+
+
+def generate_with_pauses(tts_instance, text, output_path, infer_kwargs):
+    """Generate audio, handling [pause:Xms]/[pause:Xs] tags in text.
+
+    Fast path: if no pause tags are present, calls tts.infer() directly
+    with zero overhead.  Otherwise, generates each text segment separately
+    and concatenates them with silence of the requested duration.
+    """
+    import numpy as np
+    import soundfile as sf
+
+    segments = parse_pause_segments(text)
+
+    # Fast path: no pause tags at all
+    if len(segments) <= 1 and (not segments or segments[0][0] == "text"):
+        clean_text = segments[0][1] if segments else text
+        tts_instance.infer(text=clean_text, output_path=output_path, **infer_kwargs)
+        return output_path
+
+    # Pause path: generate each text segment, insert silence
+    sample_rate = 22050
+    temp_files = []
+    try:
+        audio_parts = []
+        for seg_type, seg_value in segments:
+            if seg_type == "pause":
+                num_samples = int(sample_rate * seg_value / 1000)
+                silence = np.zeros(num_samples, dtype=np.int16)
+                audio_parts.append(silence)
+            else:
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp_path = tmp.name
+                tmp.close()
+                temp_files.append(tmp_path)
+                tts_instance.infer(text=seg_value, output_path=tmp_path, **infer_kwargs)
+                data, sr = sf.read(tmp_path, dtype="int16")
+                audio_parts.append(data)
+
+        if audio_parts:
+            combined = np.concatenate(audio_parts)
+            sf.write(output_path, combined, sample_rate, subtype="PCM_16")
+    finally:
+        for tmp_path in temp_files:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+    return output_path
+
+
 def load_config_for_generation(config_data):
     """Extract all tts.infer() parameters from a config dict.
 
@@ -355,9 +434,9 @@ def load_config_for_generation(config_data):
     tts.infer(), or None if the prompt audio cannot be found.
     """
     # Resolve prompt audio
-    prompt_audio = config_data.get("prompt_audio_copy") or config_data.get("prompt_audio")
+    prompt_audio = config_data.get("prompt_audio_copy") or config_data.get("prompt_audio") or None
     if prompt_audio and not os.path.exists(prompt_audio):
-        prompt_audio = config_data.get("prompt_audio")
+        prompt_audio = config_data.get("prompt_audio") or None
         if prompt_audio and not os.path.exists(prompt_audio):
             prompt_audio = None
     if not prompt_audio:
@@ -372,9 +451,9 @@ def load_config_for_generation(config_data):
             emo_mode = 0
 
     # Resolve emotion reference audio
-    emo_ref = config_data.get("emotion_reference_audio_copy") or config_data.get("emotion_reference_audio")
+    emo_ref = config_data.get("emotion_reference_audio_copy") or config_data.get("emotion_reference_audio") or None
     if emo_ref and not os.path.exists(emo_ref):
-        emo_ref = config_data.get("emotion_reference_audio")
+        emo_ref = config_data.get("emotion_reference_audio") or None
         if emo_ref and not os.path.exists(emo_ref):
             emo_ref = None
 
@@ -389,6 +468,7 @@ def load_config_for_generation(config_data):
     emo_random = bool(config_data.get("emotion_random_sampling", False))
 
     max_text_tokens = int(config_data.get("max_text_tokens_per_sentence", 120))
+    interval_silence = int(config_data.get("interval_silence", 200))
     seed = normalize_seed(config_data.get("seed"))
 
     generation_kwargs = {
@@ -412,6 +492,7 @@ def load_config_for_generation(config_data):
         "emo_random": emo_random,
         "use_emo_text": (emo_mode == 3),
         "max_text_tokens": max_text_tokens,
+        "interval_silence": interval_silence,
         "seed": seed,
         "generation_kwargs": generation_kwargs,
     }
@@ -422,6 +503,7 @@ def gen_single(emo_control_method,prompt, text,
                vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                emo_text,emo_random,
                max_text_tokens_per_sentence=120,
+               interval_silence=200,
                seed_value=None,
                 *args, progress=gr.Progress()):
     # set gradio progress
@@ -480,14 +562,17 @@ def gen_single(emo_control_method,prompt, text,
     prompt_copy = copy_prompt_audio(prompt, output_basename)
 
     print(f"Emo control mode:{emo_mode},vec:{vec}")
-    output = tts.infer(spk_audio_prompt=prompt, text=text,
-                       output_path=output_path,
-                       emo_audio_prompt=emo_ref_path, emo_alpha=emo_weight,
-                       emo_vector=vec,
-                       use_emo_text=(emo_mode==3), emo_text=emo_text,use_random=emo_random,
-                       verbose=cmd_args.verbose,
-                       max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
-                       **kwargs)
+    infer_kwargs = dict(
+        spk_audio_prompt=prompt,
+        emo_audio_prompt=emo_ref_path, emo_alpha=emo_weight,
+        emo_vector=vec,
+        use_emo_text=(emo_mode==3), emo_text=emo_text, use_random=emo_random,
+        verbose=cmd_args.verbose,
+        interval_silence=int(interval_silence),
+        max_text_tokens_per_sentence=int(max_text_tokens_per_sentence),
+        **kwargs,
+    )
+    output = generate_with_pauses(tts, text, output_path, infer_kwargs)
 
     # Save config JSON alongside the WAV
     config_path = os.path.splitext(output_path)[0] + '.json'
@@ -506,6 +591,7 @@ def gen_single(emo_control_method,prompt, text,
         emo_text=emo_text,
         emo_random=emo_random,
         max_text_tokens_per_sentence=max_text_tokens_per_sentence,
+        interval_silence=interval_silence,
         do_sample=do_sample,
         temperature=temperature,
         top_p=top_p,
@@ -598,6 +684,12 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                         key="max_text_tokens_per_sentence",
                         info="Higher values mean longer sentences; adjust between 80-200",
                     )
+                interval_silence = gr.Slider(
+                        label="Interval silence (ms)", value=200,
+                        minimum=0, maximum=2000, step=10,
+                        key="interval_silence",
+                        info="Silence between auto-split sentence segments (0 = none)",
+                    )
                 with gr.Accordion("Preview sentences", open=True) as sentences_settings:
                     sentences_preview = gr.Dataframe(
                         headers=["Index", "Sentence", "Token Count"],
@@ -681,17 +773,13 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                         interactive=True
                     )
                     with gr.Group():
-                        gr.Markdown("**Assign Config**")
-                        with gr.Row():
-                            json_file_dropdown = gr.Dropdown(
-                                label="JSON config file",
-                                choices=[],
-                                value=None,
-                                allow_custom_value=True,
-                                interactive=True,
-                                scale=4
-                            )
-                            refresh_json_list_button = gr.Button("Refresh", scale=0)
+                        gr.Markdown("**Assign Config** — drop a JSON config file")
+                        json_file_drop = gr.File(
+                            label="Drop JSON config here",
+                            file_types=[".json"],
+                            type="filepath",
+                            interactive=True,
+                        )
                         assign_config_button = gr.Button("Assign Config to Selected Line")
                     save_override_button = gr.Button("Save Override (current settings \u2192 this line)")
                     dialogue_config_preview = gr.Code(
@@ -703,7 +791,10 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
     def on_input_text_change(text, max_tokens_per_sentence):
         if text and len(text) > 0:
-            text_tokens_list = tts.tokenizer.tokenize(text)
+            clean_text = PAUSE_TAG_PATTERN.sub('', text).strip()
+            if not clean_text:
+                return {sentences_preview: gr.update(value=[], visible=True, type="array")}
+            text_tokens_list = tts.tokenizer.tokenize(clean_text)
 
             sentences = tts.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment=int(max_tokens_per_sentence))
             data = []
@@ -747,13 +838,13 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
     def load_config_from_file(config_file):
         """Load a config JSON and fill in all UI components."""
         if not config_file:
-            return [gr.update()] * 28
+            return [gr.update()] * 29
         try:
             with open(config_file, 'r', encoding='utf-8') as f:
                 config = json.load(f)
         except Exception as e:
             gr.Warning(f"Failed to load config: {e}")
-            return [gr.update()] * 28
+            return [gr.update()] * 29
         gr.Info("Config loaded successfully! All settings restored.")
         return _config_to_ui_updates(config)
 
@@ -827,17 +918,6 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             base = f"{base}  \n{message}" if base else message
         return gr.update(value=base)
 
-    def refresh_json_dropdown():
-        outputs_dir = os.path.abspath(os.path.join(current_dir, "outputs"))
-        json_files = []
-        if os.path.isdir(outputs_dir):
-            for f in os.listdir(outputs_dir):
-                if f.endswith(".json") and f != "generation_history.csv":
-                    full = os.path.join(outputs_dir, f)
-                    json_files.append((os.path.getmtime(full), f))
-        json_files.sort(key=lambda x: x[0], reverse=True)
-        choices = [name for _, name in json_files]
-        return gr.update(choices=choices, value=choices[0] if choices else None)
 
     def refresh_dialogue_csv_dropdown():
         tasks_dir = os.path.abspath(os.path.join(current_dir, "tasks"))
@@ -912,6 +992,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         last_gen_col = csv_cols_lower.get("last_generated", None)
 
         updated_rows = []  # fresh start from CSV
+        next_id = 1  # reset IDs on each load
         first_id = next_id
         for _, csv_row in df.iterrows():
             character = str(csv_row[char_col]).strip()
@@ -986,24 +1067,39 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         status_update = format_dialogue_status(sel_row, msg)
         return updated_rows, next_id, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
 
-    def assign_config_to_dialogue_line(rows, selected_value, json_filename):
-        rows = rows or []
-        if not json_filename:
-            gr.Warning("Select a JSON config file first.")
-            dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, selected_value)
-            table_update = gr.update(value=build_dialogue_table_data(rows))
-            status_update = format_dialogue_status(sel_row, "No config file selected.")
-            return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+    def _resolve_original_json_path(temp_path):
+        """Resolve the original JSON config path from a Gradio temp upload.
 
-        # Resolve JSON path
-        json_path = json_filename
-        if not os.path.isabs(json_path):
-            json_path = os.path.join("outputs", json_filename)
-        if not os.path.exists(json_path):
-            gr.Warning(f"Config file not found: {json_path}")
+        Strategy: read the JSON, check its 'config_file' key for the original
+        path.  Fall back to filename matching in outputs/ and tasks/override_config/.
+        Returns the original absolute path, or the temp path if unresolvable.
+        """
+        if not temp_path or not os.path.exists(temp_path):
+            return temp_path
+        try:
+            with open(temp_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            # Check embedded original path
+            orig = data.get("config_file", "")
+            if orig and os.path.exists(orig):
+                return os.path.abspath(orig)
+        except Exception:
+            pass
+        # Fall back: search by filename
+        basename = os.path.basename(temp_path)
+        for search_dir in ["outputs", os.path.join("tasks", "override_config")]:
+            candidate = os.path.join(search_dir, basename)
+            if os.path.exists(candidate):
+                return os.path.abspath(candidate)
+        return temp_path
+
+    def assign_config_to_dialogue_line(rows, selected_value, json_temp_path):
+        rows = rows or []
+        if not json_temp_path:
+            gr.Warning("Drop a JSON config file first.")
             dropdown_update, _, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, selected_value)
             table_update = gr.update(value=build_dialogue_table_data(rows))
-            status_update = format_dialogue_status(sel_row, f"File not found: {json_path}")
+            status_update = format_dialogue_status(sel_row, "No config file dropped.")
             return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
 
         dropdown_update, resolved_id, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, selected_value)
@@ -1014,13 +1110,16 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
 
         try:
-            with open(json_path, 'r', encoding='utf-8') as f:
+            with open(json_temp_path, 'r', encoding='utf-8') as f:
                 config_data = json.load(f)
         except Exception as e:
             gr.Warning(f"Failed to load JSON: {e}")
             table_update = gr.update(value=build_dialogue_table_data(rows))
             status_update = format_dialogue_status(sel_row, f"JSON error: {e}")
             return rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
+
+        # Resolve to original path (not Gradio temp)
+        json_path = _resolve_original_json_path(json_temp_path)
 
         updated_rows = []
         for row in rows:
@@ -1037,9 +1136,9 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         return updated_rows, table_update, dropdown_update, gr.update(value=config_preview), output_update, status_update
 
     def _config_to_ui_updates(config):
-        """Convert a config dict to the 28 UI component updates (same order as load_config_from_file)."""
+        """Convert a config dict to the 29 UI component updates (same order as load_config_from_file)."""
         if not config:
-            return [gr.update()] * 28
+            return [gr.update()] * 29
 
         mode = config.get("emotion_control_mode", 0)
         if not (0 <= mode < len(EMO_CHOICES)):
@@ -1050,15 +1149,15 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         while len(vec) < 8:
             vec.append(0)
 
-        prompt_path = config.get("prompt_audio_copy") or config.get("prompt_audio")
+        prompt_path = config.get("prompt_audio_copy") or config.get("prompt_audio") or None
         if prompt_path and not os.path.exists(prompt_path):
-            prompt_path = config.get("prompt_audio")
+            prompt_path = config.get("prompt_audio") or None
             if prompt_path and not os.path.exists(prompt_path):
                 prompt_path = None
 
-        emo_ref = config.get("emotion_reference_audio_copy") or config.get("emotion_reference_audio")
+        emo_ref = config.get("emotion_reference_audio_copy") or config.get("emotion_reference_audio") or None
         if emo_ref and not os.path.exists(emo_ref):
-            emo_ref = config.get("emotion_reference_audio")
+            emo_ref = config.get("emotion_reference_audio") or None
             if emo_ref and not os.path.exists(emo_ref):
                 emo_ref = None
 
@@ -1096,6 +1195,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             gr.update(value=config.get("length_penalty", 0.0)),
             gr.update(value=config.get("max_mel_tokens", 1500)),
             gr.update(value=config.get("max_text_tokens_per_sentence", 120)),
+            gr.update(value=config.get("interval_silence", 200)),
             gr.update(value=config.get("seed")),
             gr.update(visible=ref_vis),
             gr.update(visible=vec_vis),
@@ -1128,7 +1228,8 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                                 v1, v2, v3, v4, v5, v6, v7, v8,
                                 do_sample_val, temperature_val, top_p_val, top_k_val,
                                 num_beams_val, repetition_penalty_val, length_penalty_val,
-                                max_mel_tokens_val, max_text_tokens_val, seed_val):
+                                max_mel_tokens_val, max_text_tokens_val, interval_silence_val,
+                                seed_val):
         """Save current UI settings as an override config for the selected dialogue line."""
         rows = rows or []
         dropdown_update, resolved_id, config_preview, output_update, sel_row = prepare_dialogue_selection(rows, selected_value)
@@ -1167,6 +1268,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             emo_text=emo_text_val,
             emo_random=emo_random_val,
             max_text_tokens_per_sentence=max_text_tokens_val,
+            interval_silence=interval_silence_val,
             do_sample=do_sample_val,
             temperature=temperature_val,
             top_p=top_p_val,
@@ -1320,10 +1422,8 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
 
             try:
                 tts.gr_progress = progress
-                tts.infer(
+                infer_kwargs = dict(
                     spk_audio_prompt=params["prompt_audio"],
-                    text=text_val,
-                    output_path=output_path,
                     emo_audio_prompt=params["emo_ref"],
                     emo_alpha=params["emo_weight"],
                     emo_vector=params["emo_vector"],
@@ -1331,9 +1431,11 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                     emo_text=params["emo_text"],
                     use_random=params["emo_random"],
                     verbose=cmd_args.verbose,
+                    interval_silence=params["interval_silence"],
                     max_text_tokens_per_sentence=params["max_text_tokens"],
                     **params["generation_kwargs"],
                 )
+                generate_with_pauses(tts, text_val, output_path, infer_kwargs)
                 new_row["output_path"] = output_path
                 new_row["status"] = "Completed"
                 new_row["last_generated"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1359,6 +1461,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                     emo_text=cfg.get("emotion_text", ""),
                     emo_random=cfg.get("emotion_random_sampling", False),
                     max_text_tokens_per_sentence=cfg.get("max_text_tokens_per_sentence", 120),
+                    interval_silence=cfg.get("interval_silence", 200),
                     do_sample=cfg.get("do_sample", True),
                     temperature=cfg.get("temperature", 0.8),
                     top_p=cfg.get("top_p", 0.8),
@@ -1454,10 +1557,8 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             updated_row["config_data"] = sel_row.get("config_data")
             try:
                 tts.gr_progress = progress
-                tts.infer(
+                infer_kwargs = dict(
                     spk_audio_prompt=params["prompt_audio"],
-                    text=text_val,
-                    output_path=output_path,
                     emo_audio_prompt=params["emo_ref"],
                     emo_alpha=params["emo_weight"],
                     emo_vector=params["emo_vector"],
@@ -1465,9 +1566,11 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                     emo_text=params["emo_text"],
                     use_random=params["emo_random"],
                     verbose=cmd_args.verbose,
+                    interval_silence=params["interval_silence"],
                     max_text_tokens_per_sentence=params["max_text_tokens"],
                     **params["generation_kwargs"],
                 )
+                generate_with_pauses(tts, text_val, output_path, infer_kwargs)
                 updated_row["output_path"] = output_path
                 updated_row["status"] = "Completed"
                 updated_row["last_generated"] = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -1492,6 +1595,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                     emo_text=cfg.get("emotion_text", ""),
                     emo_random=cfg.get("emotion_random_sampling", False),
                     max_text_tokens_per_sentence=cfg.get("max_text_tokens_per_sentence", 120),
+                    interval_silence=cfg.get("interval_silence", 200),
                     do_sample=cfg.get("do_sample", True),
                     temperature=cfg.get("temperature", 0.8),
                     top_p=cfg.get("top_p", 0.8),
@@ -1545,6 +1649,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
                             vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
                              emo_text,emo_random,
                              max_text_tokens_per_sentence,
+                             interval_silence,
                              seed_input,
                              *advanced_params,
                      ],
@@ -1559,7 +1664,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
             do_sample, temperature, top_p, top_k, num_beams,
             repetition_penalty, length_penalty, max_mel_tokens,
-            max_text_tokens_per_sentence, seed_input,
+            max_text_tokens_per_sentence, interval_silence, seed_input,
             emotion_reference_group, emotion_vector_group, emo_text_group,
         ]
     )
@@ -1578,15 +1683,9 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         outputs=[dialogue_rows_state, next_dialogue_id_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status]
     )
 
-    refresh_json_list_button.click(
-        refresh_json_dropdown,
-        inputs=[],
-        outputs=[json_file_dropdown]
-    )
-
     assign_config_button.click(
         assign_config_to_dialogue_line,
-        inputs=[dialogue_rows_state, dialogue_selected_entry, json_file_dropdown],
+        inputs=[dialogue_rows_state, dialogue_selected_entry, json_file_drop],
         outputs=[dialogue_rows_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status]
     )
 
@@ -1606,7 +1705,7 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
             vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
             do_sample, temperature, top_p, top_k,
             num_beams, repetition_penalty, length_penalty,
-            max_mel_tokens, max_text_tokens_per_sentence, seed_input,
+            max_mel_tokens, max_text_tokens_per_sentence, interval_silence, seed_input,
         ],
         outputs=[dialogue_rows_state, dialogue_table, dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status]
     )
@@ -1616,13 +1715,13 @@ with gr.Blocks(title="IndexTTS Demo") as demo:
         inputs=[dialogue_selected_entry, dialogue_rows_state],
         outputs=[
             dialogue_selected_entry, dialogue_config_preview, dialogue_output_player, dialogue_status,
-            # 28 global UI components (same order as load_config_from_file)
+            # 29 global UI components (same order as load_config_from_file)
             prompt_audio, input_text_single, emo_control_method,
             emo_upload, emo_weight, emo_text, emo_random,
             vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8,
             do_sample, temperature, top_p, top_k, num_beams,
             repetition_penalty, length_penalty, max_mel_tokens,
-            max_text_tokens_per_sentence, seed_input,
+            max_text_tokens_per_sentence, interval_silence, seed_input,
             emotion_reference_group, emotion_vector_group, emo_text_group,
         ]
     )
